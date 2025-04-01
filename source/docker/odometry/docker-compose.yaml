@@ -1,0 +1,20 @@
+version: '3'
+services:
+  openvins:
+    container_name: openvins_ros
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - "/media/cvg/T7 Shield/spot-aria-recordings:/bags"
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+      - "/home/cvg/Documents/CopyCat:/CopyCat"
+      - "/dev:/dev"
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
+      - DISPLAY=${DISPLAY}
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]

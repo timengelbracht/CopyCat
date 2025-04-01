@@ -1,0 +1,80 @@
+version: "3.8"
+services:
+  recording_gripper_testing:
+    build: 
+      context: . 
+      dockerfile: Dockerfile
+    container_name: spot_aria_gripper_recording_testing
+    network_mode: "host"  # Allows ROS to work with host networking
+    privileged: true      # Grants USB device access
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+      - "/dev/ttyUSB1:/dev/ttyUSB1"
+      - "/dev/ttyUSB2:/dev/ttyUSB2"
+      - /dev/video0:/dev/video0 #zed mini
+      - /dev/video1:/dev/video1 # zed mini
+      - /dev/video2:/dev/video2 # zed mini
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XDG_RUNTIME_DIR=/tmp
+      - WAYLAND_DISPLAY
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
+      - UDEV=1
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
+    volumes:
+      - /media/cvg/T7 Shield/spot-aria-recordings:/bags  
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+      - /home/cvg/Documents/CopyCat:/CopyCat
+    stdin_open: true
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    command: ["/bin/bash"]
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: "nvidia"
+              count: all
+              capabilities: ["gpu"]
+  recording_gripper_deploy:
+    build: 
+      context: . 
+      dockerfile: Dockerfile-light
+    container_name: spot_aria_gripper_recording
+    network_mode: "host"  # Allows ROS to work with host networking
+    privileged: true   
+    group_add:
+      - plugdev
+      - video
+      - dialout
+    devices:
+      - "/dev:/dev"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XDG_RUNTIME_DIR=/tmp
+      - WAYLAND_DISPLAY
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
+      - UDEV=1
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
+    volumes:
+      - /media/cvg/T7 Shield/spot-aria-recordings:/bags  
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+      - "/run/udev:/run/udev:ro"
+      - "/dev/bus/usb:/dev/bus/usb:ro"
+      - "/dev/serial/by-id:/dev/serial/by-id"
+      - "/dev:/dev"
+    stdin_open: true
+    #entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    command: ["/bin/bash"]
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: "nvidia"
+              count: all
+              capabilities: ["gpu"]
