@@ -71,10 +71,3 @@ services:
     #entrypoint: ["/bin/bash", "/entrypoint.sh"]
     command: ["/bin/bash"]
     tty: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: "nvidia"
-              count: all
-              capabilities: ["gpu"]
