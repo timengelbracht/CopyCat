@@ -1,17 +1,24 @@
 #!/bin/bash
+set -e
 
-# Start udev and apply rules
-service udev start
-udevadm control --reload-rules
-udevadm trigger
-udevadm settle
+# Source ROS
+source /opt/ros/noetic/setup.bash
 
-# Ensure devices are correctly assigned before starting the main application
-sleep 2  # Give time for udev to apply rules
+# Source workspace if already built
+if [ -f /catkin_ws/devel/setup.bash ]; then
+    source /catkin_ws/devel/setup.bash
+fi
 
-# Print available devices for debugging
-ls -l /dev/imu /dev/gripper
+# Clone and build zed-ros-wrapper if not already present
+if [ ! -d "/catkin_ws/src/zed-ros-wrapper" ]; then
+    echo "Cloning ZED ROS Wrapper..."
+    git clone --recursive https://github.com/stereolabs/zed-ros-wrapper.git /catkin_ws/src/zed-ros-wrapper
+    cd /catkin_ws/src/zed-ros-wrapper && git checkout v3.8.x
+    echo "🔧 Building ZED ROS Wrapper..."
+    cd /catkin_ws
+    catkin build zed_ros zed_wrapper zed_nodelets
+    source /catkin_ws/devel/setup.bash
+fi
 
-# Start the main process
+# Continue to default command (bash or roslaunch etc.)
 exec "$@"
-#exec /bin/bash

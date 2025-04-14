@@ -41,9 +41,9 @@ services:
   recording_gripper_deploy:
     build: 
       context: . 
-      dockerfile: Dockerfile-light
+      dockerfile: Dockerfile-jetson
     container_name: spot_aria_gripper_recording
-    network_mode: "host"  # Allows ROS to work with host networking
+    network_mode: "host"  
     privileged: true   
     group_add:
       - plugdev
@@ -51,6 +51,7 @@ services:
       - dialout
     devices:
       - "/dev:/dev"
+    runtime: nvidia
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
@@ -60,6 +61,10 @@ services:
       - UDEV=1
       - ROS_MASTER_URI=http://localhost:11311
       - ROS_IP=127.0.0.1
+      - CUDA_HOME=/usr/local/cuda_host
+      - CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda_host
+      - LD_LIBRARY_PATH=/usr/local/cuda_host/lib64
+      - PATH=/usr/local/cuda_host/bin:${PATH}
     volumes:
       - /media/cvg/T7 Shield/spot-aria-recordings:/bags  
       - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
@@ -67,7 +72,15 @@ services:
       - "/dev/bus/usb:/dev/bus/usb:ro"
       - "/dev/serial/by-id:/dev/serial/by-id"
       - "/dev:/dev"
+      - "/usr/local/cuda-11.4:/usr/local/cuda_host:ro"
     stdin_open: true
-    #entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    command: ["/bin/bash"]
+    entrypoint: ["/entrypoint.sh"]
+    command: ["bash"]
     tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: "nvidia"
+              count: all
+              capabilities: ["gpu"]
