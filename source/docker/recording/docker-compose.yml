@@ -4,7 +4,7 @@ services:
     build: 
       context: . 
       dockerfile: Dockerfile
-    container_name: spot_aria_gripper_recording_testing
+    container_name: gripper_recording_testing
     network_mode: "host"  # Allows ROS to work with host networking
     privileged: true      # Grants USB device access
     devices:
@@ -38,11 +38,11 @@ services:
             - driver: "nvidia"
               count: all
               capabilities: ["gpu"]
-  recording_gripper_deploy:
+  recording_gripper_jetson:
     build: 
       context: . 
       dockerfile: Dockerfile-jetson
-    container_name: spot_aria_gripper_recording
+    container_name: gripper_recording_jetson
     network_mode: "host"  
     privileged: true   
     group_add:
@@ -84,3 +84,37 @@ services:
             - driver: "nvidia"
               count: all
               capabilities: ["gpu"]
+  recording_gripper_rpi:
+    build: 
+      context: . 
+      dockerfile: Dockerfile-light
+    container_name: gripper_recording_rpi
+    network_mode: "host"  
+    privileged: true   
+    group_add:
+      - plugdev
+      - video
+      - dialout
+    devices:
+      - "/dev:/dev"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XDG_RUNTIME_DIR=/tmp
+      - WAYLAND_DISPLAY
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
+      - UDEV=1
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
+    volumes:
+      - /media/cvg/T7 Shield/spot-aria-recordings:/bags  
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+      - "/run/udev:/run/udev:ro"
+      - "/dev/bus/usb:/dev/bus/usb:ro"
+      - "/dev/serial/by-id:/dev/serial/by-id"
+      - "/dev:/dev"
+    stdin_open: true
+    entrypoint: ["/entrypoint.sh"]
+    command: ["bash"]
+    tty: true
+

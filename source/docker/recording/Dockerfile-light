@@ -33,9 +33,9 @@ RUN apt-get update && apt-get install -y \
     libhidapi-dev \ 
     libopencv-dev \
     libopencv-viz-dev \
+    libxmlrpcpp-dev \
+    librosconsole-dev \
     && rm -rf /var/lib/apt/lists/*
-
-
 
 RUN mkdir -p /catkin_ws/src
 WORKDIR /catkin_ws
@@ -45,6 +45,8 @@ RUN git clone --recursive --branch noetic-devel https://github.com/ROBOTIS-GIT/d
 RUN git clone --recursive --branch noetic-devel https://github.com/ROBOTIS-GIT/dynamixel-workbench.git src/dynamixel-workbench
 RUN git clone https://github.com/timengelbracht/gelsight_digit_ros.git src/gelsight_digit_ros
 RUN git clone https://github.com/timengelbracht/zed_open_capture_ros.git src/zed_open_capture_ros
+RUN git clone https://github.com/timengelbracht/gripper_force_controller.git src/gripper_force_controller
+RUN git clone https://gitlab.com/botasys/bota_driver.git src/bota_driver
 
 # Install ZED Open Capture
 RUN git clone https://github.com/stereolabs/zed-open-capture.git src/zed-open-capture
@@ -56,13 +58,13 @@ RUN cd build && sudo make install && sudo ldconfig
 WORKDIR /catkin_ws
 
 # Securely Clone Bitbucket Repos
-RUN mkdir -p /root/.ssh
-COPY id_ed25519 /root/.ssh/id_ed25519
-COPY id_ed25519.pub /root/.ssh/id_ed25519.pub
-RUN chmod 600 /root/.ssh/id_ed25519
-RUN ssh-keyscan bitbucket.org >> /root/.ssh/known_hosts
-RUN ssh-keyscan github.com >> /root/.ssh/known_hosts
-RUN GIT_SSH_COMMAND="ssh -i /root/.ssh/id_ed25519 -o IdentitiesOnly=yes" git clone git@github.com:timengelbracht/gripper_force_controller.git src/gripper_force_controller
+#RUN mkdir -p /root/.ssh
+#COPY id_ed25519 /root/.ssh/id_ed25519
+#COPY id_ed25519.pub /root/.ssh/id_ed25519.pub
+#RUN chmod 600 /root/.ssh/id_ed25519
+#RUN ssh-keyscan bitbucket.org >> /root/.ssh/known_hosts
+#RUN ssh-keyscan github.com >> /root/.ssh/known_hosts
+#RUN GIT_SSH_COMMAND="ssh -i /root/.ssh/id_ed25519 -o IdentitiesOnly=yes" git clone git@github.com:timengelbracht/gripper_force_controller.git src/gripper_force_controller
 
 RUN apt-get update && rosdep update
 RUN rosdep install --from-paths src --ignore-src -r -y || true
