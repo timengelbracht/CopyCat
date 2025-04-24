@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - "/media/cvg/T7 Shield/spot-aria-recordings:/bags"
+      - "/media/cvg/T7 Shield1/spot-aria-recordings:/bags"
       - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
       - "/home/cvg/Documents/CopyCat:/CopyCat"
       - "/dev:/dev"
