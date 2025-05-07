@@ -1,125 +1,157 @@
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
+#!/usr/bin/env python3
+import math, time, os
 from pathlib import Path
-import cv2
-import matplotlib
-matplotlib.use('TkAgg')
 
-# -------- CONFIG --------
-FPS = 100  # playback speed
-WIN_SCALE = 0.5
-WINDOW_TITLE = "Synchronized Sensor Playback"
+import cv2, numpy as np
+import pandas as pd
 
-# Paths to synced data
+# ----------------------------------------------------  VIDEO PART  --
 SYNCED_DIR = Path("/bags/spot-aria-recordings/dlab_recordings/extracted/door_6")
-MODALITY_IMAGES = {
-    "aria_rgb": SYNCED_DIR / "aria_human_ego" / "camera_rgb",
-    "zed_right": SYNCED_DIR / "gripper_right" / "zedm/zed_node/right/image_rect_color",
-    "digit": SYNCED_DIR / "gripper_right" / "digit/right/image_raw",
-    "iphone_rgb": SYNCED_DIR / "iphone_left" / "camera_rgb",
+
+BASE_STREAMS = {
+    "aria_rgb"   : SYNCED_DIR / "aria_human_ego/camera_rgb/data.mp4",
+    "zed_right"  : SYNCED_DIR / "gripper_right/zedm/zed_node/right/image_rect_color/data.mp4",
+    "digit_right": SYNCED_DIR / "gripper_right/digit/right/image_raw/data.mp4",
+    "iphone_rgb" : SYNCED_DIR / "iphone_left/camera_rgb/data.mp4",
+    "depth"      : SYNCED_DIR / "gripper_right/zedm/zed_node/depth/depth_registered/data.mp4",
+}
+AUTO_LEFT = {"zed_left": "zed_right", "digit_left": "digit_right"}
+VIDEO_PATHS = BASE_STREAMS | {
+    k: Path(str(BASE_STREAMS[v]).replace("/right/", "/left/"))
+    for k, v in AUTO_LEFT.items()
 }
 
-CSV_PATHS = {
-    "position": SYNCED_DIR / "gripper_right" / "joint_states" / "data.csv",
-    "data": SYNCED_DIR / "gripper_right" / "gripper_force_trigger" / "data.csv",
+FRAME_SZ  = (320, 240)          # size per tile
+GRID_COL  = math.ceil(math.sqrt(len(VIDEO_PATHS)))
+GRID_ROW  = math.ceil(len(VIDEO_PATHS)/GRID_COL)
+TILE_W, TILE_H = FRAME_SZ
+SIG_HEIGHT = 120                # pixel height for graphs
+WIN_NAME   = "Videos + Signals (q to quit)"
+
+# ----------------------------------------------------  CSV PART  ----
+CSV_DIR = SYNCED_DIR / "gripper_right"
+CSV_FILES = {
+    "joint":   CSV_DIR / "joint_states/data.csv",
+    "force":   CSV_DIR / "gripper_force_trigger/data.csv",
+}
+# Column to show for each CSV:
+CSV_COL = {
+    "joint":  "effort",       # first joint angle
+    "force":  "data",            # thresholded force value
 }
 
-# -------- Load image timestamps --------
-all_ts = []
-image_buffers = {}
-image_data = {}
+def strlist_to_float(series, key):
+    """If a cell looks like '[1.23]', return 1.23; otherwise leave as-is."""
+    def _convert(x):
+        if isinstance(x, str) and x.startswith("[") and x.endswith("]"):
+            try:
+                val = float(x.strip("[]").split()[0])
+                if val > 176.0 and key=="joint":
+                    return 0.0
+                return val
+            except ValueError:
+                return np.nan
+        return x
+    return series.apply(_convert).astype(float)
 
-for name, folder in MODALITY_IMAGES.items():
-    image_buffers[name] = {}
-    image_data[name] = {}
-    ext = ".jpg" if "iphone" in name else ".png"
-    for img_path in folder.glob(f"*{ext}"):
-        try:
-            ts = int(img_path.stem)
-            image_buffers[name][ts] = img_path
-            all_ts.append(ts)
+csv_df, csv_ptr = {}, {}
+for key, f in CSV_FILES.items():
+    df = (pd.read_csv(f)
+            .sort_values("timestamp")
+            .reset_index(drop=True))
 
-            # Preload image
-            img = cv2.imread(str(img_path))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (160, 120))  # <<< resize here ONCE
-            image_data[name][ts] = img
-        except:
+    col = CSV_COL[key]
+    df[col] = strlist_to_float(df[col], key)   # <-- convert here
+
+    base = df["timestamp"].iloc[0]        # first sample time
+    df["timestamp"] = df["timestamp"] - base
+
+    csv_df[key]  = df
+    csv_ptr[key] = 0
+
+# scale signals to 0-100 vertically (simple auto-range)
+sig_minmax = {k: (df[c].min(), df[c].max()) for k, df in csv_df.items() for c in [CSV_COL[k]]}
+
+# -------------------------------------------------  DEPTH PALETTE  --
+def vis_depth(img):
+    if len(img.shape)==3: img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    norm = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+# -------------------------------------------------  OPEN VIDEOS  ---
+caps, period, next_t, frame_last, ended = {}, {}, {}, {}, {}
+for name, path in VIDEO_PATHS.items():
+    caps[name] = cv2.VideoCapture(str(path))
+    fps = caps[name].get(cv2.CAP_PROP_FPS) or 30
+    period[name] = 1.0/fps
+    next_t[name] = 0.0
+    ended[name]  = False
+    frame_last[name] = np.zeros((TILE_H, TILE_W, 3), np.uint8)
+
+# -------------------------------------------------  MOSAIC HELPER -
+def mosaic(frames):
+    blank = np.zeros_like(frames[0])
+    pads  = frames + [blank]*(GRID_ROW*GRID_COL-len(frames))
+    rows  = [np.hstack(pads[r*GRID_COL:(r+1)*GRID_COL]) for r in range(GRID_ROW)]
+    return np.vstack(rows)
+
+# -------------------------------------------------  WINDOW --------
+cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+full_w = TILE_W*GRID_COL
+full_h = TILE_H*GRID_ROW + SIG_HEIGHT
+cv2.resizeWindow(WIN_NAME, full_w, full_h)
+
+# -------------------------------------------------  MAIN LOOP -----
+t0 = time.time()
+order = list(VIDEO_PATHS.keys())
+sig_img = np.zeros((SIG_HEIGHT, full_w, 3), np.uint8)
+
+while True:
+    now_s   = time.time() - t0
+    now_ns  = int(now_s*1e9)
+
+    # ---------- video frames -------------
+    for name, cap in caps.items():
+        if ended[name] or now_s < next_t[name]:
             continue
+        ok, fr = cap.read()
+        if not ok:
+            ended[name] = True
+            continue
+        if "depth" in name: fr = vis_depth(fr)
+        frame_last[name] = cv2.resize(fr, FRAME_SZ)
+        next_t[name]    += period[name]
 
-# Load all CSVs
-csv_data = {}
-for name, csv_path in CSV_PATHS.items():
-    df = pd.read_csv(csv_path)
-    df = df.sort_values("timestamp")
-    csv_data[name] = df
+    # ---------- CSV signals --------------
+    sig_img[:] = 0
+    for idx, key in enumerate(["force", "joint"]):
+        df = csv_df[key]; col = CSV_COL[key]
+        ptr = csv_ptr[key]
+        while ptr < len(df) and df.iloc[ptr]["timestamp"] <= now_ns:
+            ptr += 1
+        csv_ptr[key] = ptr
+        hist = df.iloc[:ptr][col].values
+        if len(hist) < 2: continue
+        # map value -> y pixel
+        lo, hi = sig_minmax[key]
+        ys = np.interp(hist, (lo, hi), (SIG_HEIGHT-10, 10)).astype(int)
+        xs = np.linspace(0, full_w-1, len(ys)).astype(int)
+        pts = np.vstack([xs, ys]).T.reshape(-1,1,2)
+        color = (255,255,255) if key=="force" else (255,255,0)
+        cv2.polylines(sig_img, [pts], False, color, 1, cv2.LINE_AA)
+        cv2.putText(sig_img, key, (10,20+20*idx), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, color, 1, cv2.LINE_AA)
 
-# Get common sorted timeline
-timeline = sorted(set(all_ts))
+    # ---------- display ------------------
+    if all(ended.values()) and all(ptr>=len(df) for ptr,df in zip(csv_ptr.values(),csv_df.values())):
+        break
 
-# -------- Setup Matplotlib grid viewer --------
-fig, axs = plt.subplots(3, 2, figsize=(12, 8))  # 4 image views + 2 CSV plots
-fig.canvas.manager.set_window_title(WINDOW_TITLE)
-plt.subplots_adjust(hspace=0.4)
+    grid = mosaic([frame_last[k] for k in order])
+    full = np.vstack([grid, sig_img])
+    cv2.imshow(WIN_NAME, full)
+    if cv2.waitKey(1)&0xFF==ord('q'): break
+    time.sleep(0.001)
 
-image_axes = axs[:2, :].flatten()
-csv_axes = axs[2, :]
-
-# Initialize image panels
-image_names = list(image_buffers.keys())
-image_ims = [ax.imshow(np.zeros((100, 100, 3), dtype=np.uint8)) for ax in image_axes]
-for ax, name in zip(image_axes, image_names):
-    ax.set_title(name)
-    ax.axis("off")
-
-# Initialize CSV plots
-plot_lines = {}
-plot_buffers = {name: [] for name in csv_data}
-plot_ts = []
-for i, (name, ax) in enumerate(zip(csv_data, csv_axes)):
-    ax.set_title(name)
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Value")
-    line, = ax.plot([], [], label=name)
-    plot_lines[name] = line
-    ax.legend()
-    # Fix y-axis based on full range of values
-    try:
-        col_vals = csv_data[name][name].apply(
-            lambda x: float(x.strip("[]")) if isinstance(x, str) and x.startswith("[") else float(x)
-        )
-        ax.set_ylim(np.min(col_vals) * 0.95, np.max(col_vals) * 1.05)
-    except Exception as e:
-        print(f"[!] Failed to set y-limits for {name}: {e}")
-
-# -------- Playback loop --------
-print("[▶] Starting synchronized playback with Matplotlib dashboard...")
-for i, t in enumerate(timeline):
-    # Update image views
-    for j, name in enumerate(image_names):
-        img = image_data[name].get(t, None)
-        if img is not None:
-            image_ims[j].set_data(img)
-
-# Update CSV plots
-plot_ts.append(t)
-for name, df in csv_data.items():
-    nearest = df.iloc[(df["timestamp"] - t).abs().argsort()[:1]]
-    value = nearest[name].values[0]
-    if isinstance(value, str) and value.startswith('['):
-        try:
-            value = float(value.strip('[]'))
-        except:
-            pass
-    try:
-        value = float(value)
-    except:
-        continue
-    plot_buffers[name].append(value)
-    plot_lines[name].set_data(plot_ts, plot_buffers[name])
-
-
-    plt.pause(0.001)
-
-plt.close()
+for cap in caps.values(): cap.release()
+cv2.destroyAllWindows()
+print("Done.")

@@ -129,6 +129,9 @@ class DataLoader:
 
         print(f"\n[✂️] Cropping data to overlap window: {min_t} → {max_t}")
         for modality in self.modalities:
+
+            print(f"modality: {modality}")
+
             kind = modality.split("_")[0]
             ext = self.extensions[kind]
             base_dir = self.base_path / "extracted" / self.rec_name / modality
@@ -155,6 +158,13 @@ class DataLoader:
                 df = df[(df["timestamp"] >= min_t) & (df["timestamp"] <= max_t)]
                 df.to_csv(csv_file, index=False)
 
+    def extract_video_all(self):
+        for modality in self.modalities:
+            kind = modality.split("_")[0]
+            print(f"\n[⇨] Extracting video from {modality}...")
+            extractor = self.extractors[kind](self.base_path, self.rec_name, modality)
+            extractor.extract_video()
+
 
 
 if __name__ == "__main__":
@@ -173,3 +183,4 @@ if __name__ == "__main__":
     manager.align_to_aria()
     manager.update_timestamps()
     manager.crop_to_shared_window()
+    manager.extract_video_all()
