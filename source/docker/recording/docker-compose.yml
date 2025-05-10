@@ -116,4 +116,23 @@ services:
     stdin_open: true
     command: ["bash"]
     tty: true
+  recording_aria:
+    build: 
+      context: .
+      dockerfile: Dockerfile-aria
+    container_name: aria_recording
+    network_mode: "host"
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - 'c 189:* rmw'  # Allow USB devices
+    volumes:
+      - ./recordings:/recordings      
+      - /etc/udev/rules.d:/etc/udev/rules.d 
+      - /run/udev:/run/udev
+    environment:
+      - LIBUSB_DEBUG=1
+    stdin_open: true
+    tty: true
 
