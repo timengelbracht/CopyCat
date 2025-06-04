@@ -2,8 +2,8 @@
 #include <std_msgs/Float32.h>
 #include "HX711.h"
 
-#define DOUT 4  
-#define SCK 5   
+#define DOUT 19  
+#define SCK 18   
 #define SCALE_FACTOR 20938  // Replace with your calibration value
 #define FORCE_CUTOFF 80  // Max force allowed (Newton)
 #define FILTER_SIZE 3  // Number of samples for smoothing

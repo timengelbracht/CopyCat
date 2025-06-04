@@ -1,7 +1,7 @@
 #include "HX711.h"
 
-#define DOUT 4  // HX711 Data
-#define SCK 5   // HX711 Clock
+#define DOUT 19  // HX711 Data
+#define SCK 18   // HX711 Clock
 
 HX711 scale;
 
@@ -18,5 +18,6 @@ void setup() {
 void loop() {
     Serial.print("Raw HX711 Reading: ");
     Serial.println(scale.get_units());
+    
     delay(500);
 }
