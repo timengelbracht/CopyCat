@@ -108,6 +108,7 @@ services:
       - /run/udev:/run/udev:ro
       - "/dev/bus/usb:/dev/bus/usb"
       - "/dev/serial/by-id:/dev/serial/by-id"
+      - "./gripper_launch_single_force.launch:/catkin_ws/src/gripper_force_controller/launch/gripper_launch_single_force.launch"
     stdin_open: true
     # entrypoint: ["/entrypoint-nano.sh"]
     command: ["bash"]

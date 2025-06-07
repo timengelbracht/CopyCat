@@ -46,7 +46,6 @@ RUN apt-get update && \
 RUN mkdir -p /catkin_ws/src
 WORKDIR /catkin_ws
 
-
 RUN git clone --depth 1 https://github.com/ros-perception/vision_opencv.git -b noetic src/vision_opencv
 RUN git clone --depth 1 https://github.com/ros-perception/image_common.git -b noetic-devel src/image_common
 RUN git clone --recursive --branch noetic-devel https://github.com/ROBOTIS-GIT/dynamixel-workbench-msgs.git src/dynamixel-workbench-msgs 
@@ -61,7 +60,10 @@ WORKDIR /catkin_ws/src/zed-open-capture
 RUN mkdir build && cd build && cmake .. && make -j$(nproc) && make install && ldconfig
 
 # Gelsight Python deps
-RUN pip install --no-cache-dir -r /catkin_ws/src/gelsight_digit_ros/requirements.txt
+RUN grep -v '^opencv-python' /catkin_ws/src/gelsight_digit_ros/requirements.txt > /tmp/filtered_requirements.txt \
+ && pip install --no-cache-dir -r /tmp/filtered_requirements.txt
+# RUN cp /catkin_ws/src/gelsight_digit_ros/udev/50-DIGIT.rules /lib/udev/rules.d/
+# RUN udevadm control --reload && udevadm trigger
 
 # ──────────────────────────────────────────────────────────────────
 # 3) ZED SDK 4.1.4  (JetPack 5.1 build)
@@ -118,7 +120,7 @@ RUN /bin/bash -c "source /opt/ros/noetic/setup.bash && \
 
 WORKDIR /catkin_ws
 RUN apt-get update && \
-    apt-get install -y python3-pip && \
+    apt-get install -y python3-pip usbutils iproute2 && \
     pip3 install -U jetson-stats && \
     rm -rf /var/lib/apt/lists/*
 
@@ -126,6 +128,9 @@ WORKDIR /catkin_ws
 # Entrypoint
 #COPY entrypoint-nano.sh /entrypoint-nano.sh
 #RUN chmod +x /entrypoint-nano.sh
+
+# so it doesnt clash with system build
+RUN pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python || true
 
 # Convenient sourcing
 SHELL ["/bin/bash","-c"]
