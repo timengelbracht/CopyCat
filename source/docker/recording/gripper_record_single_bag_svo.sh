@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 #
-# Usage: ./record_svo_rosbag.sh <experiment_name>
-# Output: /ssd/data/<experiment_name>_<YYYY-MM-DD_HH-MM-SS>.bag  +  .svo
+# Usage: ./record_svo_rosbag.sh <experiment_name> [--svo]
+# Output: /ssd/data/<experiment_name>_<YYYY-MM-DD_HH-MM-SS>.bag  [+ .svo if --svo]
 
 set -euo pipefail
 
 #############################
 # 1 – configuration
 #############################
-TARGET_DIR="/ssd/data"               # <<< permanent storage location
-mkdir -p "$TARGET_DIR"               # create if missing
+TARGET_DIR="/ssd/data"
+mkdir -p "$TARGET_DIR"
+export ZED_SDK_SVO_VERSION=1
 
 #############################
 # 2 – argument parsing
 #############################
 if [[ $# -lt 1 ]]; then
     echo "[ERROR] Please provide a base name for the recording."
-    echo "Usage: $0 <experiment_name>"
+    echo "Usage: $0 <experiment_name> [--svo]"
     exit 1
 fi
 
 NAME="$1"
+ENABLE_SVO=false
+if [[ "${2:-}" == "--svo" ]]; then
+    ENABLE_SVO=true
+fi
+
 TIMESTAMP=$(date +%F_%H-%M-%S)
 FULL_NAME="${TARGET_DIR}/${NAME}_${TIMESTAMP}"
 
@@ -36,9 +42,11 @@ cleanup() {
         wait "$ROSBAG_PID" 2>/dev/null || true
     fi
 
-    echo "[INFO] Stopping SVO recording…"
-    rosservice call /zedm/zed_node/stop_svo_recording \
-        || echo "[WARN] Failed to stop SVO recording."
+    if $ENABLE_SVO; then
+        echo "[INFO] Stopping SVO recording…"
+        rosservice call /zedm/zed_node/stop_svo_recording \
+            || echo "[WARN] Failed to stop SVO recording."
+    fi
 
     echo "[INFO] Cleanup complete."
     exit 0
@@ -48,22 +56,25 @@ trap cleanup SIGINT SIGTERM EXIT
 #############################
 # 4 – start recordings
 #############################
-echo "[INFO] Saving to: $FULL_NAME.{bag,svo}"
+echo "[INFO] Saving to: $FULL_NAME.{bag,$([[ $ENABLE_SVO == true ]] && echo svo)}"
 
-echo "[INFO] Waiting for /zedm/zed_node/start_svo_recording service…"
-until rosservice list | grep -q /zedm/zed_node/start_svo_recording; do
-    sleep 0.5
-done
+if $ENABLE_SVO; then
+    echo "[INFO] Waiting for /zedm/zed_node/start_svo_recording service…"
+    until rosservice list | grep -q /zedm/zed_node/start_svo_recording; do
+        sleep 0.5
+    done
 
-echo "[INFO] Starting SVO recording…"
-rosservice call /zedm/zed_node/start_svo_recording "{svo_filename: '${FULL_NAME}.svo'}" \
-    && echo "[✓] SVO recording started." \
-    || { echo "[✗] Failed to start SVO recording."; exit 1; }
+    echo "[INFO] Starting SVO recording…"
+    rosservice call /zedm/zed_node/start_svo_recording \
+    "{svo_filename: \"${FULL_NAME}.svo\"}" \
+      && echo "[✓] SVO recording started." \
+      || { echo "[✗] Failed to start SVO recording."; exit 1; }
+fi
 
 echo "[INFO] Starting rosbag recording…"
 rosbag record -O "${FULL_NAME}.bag" \
-    --chunksize=512 \
-    --buffsize=0 \
+    --chunksize=8192 \
+    --buffsize=104857600 \
     /digit/left/image_raw \
     /digit/right/image_raw \
     /gripper_force_trigger \
@@ -73,16 +84,15 @@ rosbag record -O "${FULL_NAME}.bag" \
     /zedm/zed_node/pose \
     /zedm/zed_node/pose_with_covariance \
     /zedm/zed_node/depth/depth_registered \
-    /zedm/zed_node/rgb/image_rect_color \
-    /zedm/zed_node/rgb/camera_info \
-    /zedm/zed_node/left/image_rect_color \
-    /zedm/zed_node/right/image_rect_color \
     /zedm/zed_node/left_raw/image_raw_color \
     /zedm/zed_node/right_raw/image_raw_color \
+    /zedm/zed_node/stereo_raw/image_raw_color \
     /tf \
     /joint_states \
+    /force_torque/ft_sensor0/ft_sensor_readings/imu  \
+    /force_torque/ft_sensor0/ft_sensor_readings/temperature \
+    /force_torque/ft_sensor0/ft_sensor_readings/wrench \
     /tf_static &
 ROSBAG_PID=$!
 
 wait "$ROSBAG_PID"
-
