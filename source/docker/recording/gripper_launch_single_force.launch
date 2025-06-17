@@ -7,18 +7,20 @@
   <arg name="zed_sync_mode"  default="2"/>
 
   <!-- DIGIT SETTINGS -->
-  <arg name="digit_left_id"  default="D21237"/>
-  <arg name="digit_right_id" default="D21236"/>
+  <arg name="digit_left_id"  default="D21235"/>
+  <arg name="digit_right_id" default="D21228"/>
   <arg name="digit_rate"     default="10"/>
 
   <!-- DYNAMIXEL -->
   <arg name="dxl_device"
        default="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT89FCUV-if00-port0"/>
   <arg name="dxl_baud"       default="57600"/>
+  <arg name="min_ticks"       default="106"/>
+  <arg name="max_ticks"       default="190"/>
 
   <!-- SERIAL (LOAD-CELL) -->
   <arg name="serial_port"
-       default="/dev/serial/by-id/usb-Arduino_LLC_Arduino_Nano_Every_20224ADB515346354E202020FF113B19-if00"/>
+       default="/dev/serial/by-id/usb-Arduino_LLC_Arduino_Nano_Every_1E4CCDEC515346354E202020FF113D46-if00"/>
   <arg name="serial_baud"    default="57600"/>
 
   <!-- ROKUBIMINI / ETHERCAT -->
@@ -71,6 +73,8 @@
         name="dynamixel_force_controller" output="screen" required="true">
     <param name="devicename"   value="$(arg dxl_device)"/>
     <param name="baudrate_dxl" value="$(arg dxl_baud)"/>
+    <param name="min_ticks" value="$(arg min_ticks)"/>
+    <param name="max_ticks" value="$(arg max_ticks)"/>
   </node>
 
   <!-- 5  Load-cell via rosserial -->
