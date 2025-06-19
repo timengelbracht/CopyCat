@@ -13,9 +13,10 @@
 
   <!-- DYNAMIXEL -->
   <arg name="dxl_device"
-       default="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT89FCUV-if00-port0"/>
+       default="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT94ELAD-if00-port0"/>
   <arg name="dxl_baud"       default="57600"/>
-
+  <arg name="min_ticks"       default="106"/>
+  <arg name="max_ticks"       default="190"/>
   <!-- SERIAL (LOAD-CELL) -->
   <arg name="serial_port"
        default="/dev/serial/by-id/usb-Arduino_LLC_Arduino_Nano_Every_20224ADB515346354E202020FF113B19-if00"/>
@@ -66,11 +67,30 @@
   </node>
 
   <!-- 4  Dynamixel gripper -->
+  <!--
   <node pkg="gripper_force_controller"
         type="dynamixel_force_controller_state_publisher.py"
         name="dynamixel_force_controller" output="screen" required="true">
     <param name="devicename"   value="$(arg dxl_device)"/>
     <param name="baudrate_dxl" value="$(arg dxl_baud)"/>
+  </node> -->
+
+  <!-- 2) Dynamixel Workbench Controller -->
+  <arg name="usb_port"
+       default="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT94ELAD-if00-port0"/>
+  <arg name="dxl_baud_rate" default="57600"/>
+
+  <include file="$(find dynamixel_workbench_controllers)/launch/dynamixel_controllers.launch">
+    <arg name="usb_port"      value="$(arg usb_port)"/>
+    <arg name="dxl_baud_rate" value="$(arg dxl_baud_rate)"/>
+  </include>
+
+  <node pkg="gripper_force_controller"
+        type="dynamixel_force_controller_fast.py"
+        name="gripper_force_controller"
+        output="screen">
+    <param name="min_ticks" value="$(arg min_ticks)"/>
+    <param name="max_ticks" value="$(arg max_ticks)"/>
   </node>
 
   <!-- 5  Load-cell via rosserial -->
