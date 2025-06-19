@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<launch>
+
+  <!-- ZED-M -->
+  <include file="$(find zed_wrapper)/launch/zedm.launch">
+    <arg name="camera_name"  value="zedm"/>
+  </include>
+  <param name="zedm/zed_node/general/serial_number" value="19189870"/>
+
+  <!-- ZED-2i -->
+  <include file="$(find zed_wrapper)/launch/zed2i.launch">
+    <arg name="camera_name"  value="zed2i"/>
+  </include>
+  <param name="zed2i/zed_node/general/serial_number" value="35693142"/>
+
+</launch>
+
+
+
+
+
+
+
+
+
+
