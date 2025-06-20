@@ -13,6 +13,13 @@
   </include>
   <param name="zed2i/zed_node/general/serial_number" value="35693142"/>
 
+  <!-- Spot driver -->
+  <include file="$(find spot_driver)/launch/driver.launch">
+    <arg name="hostname"  value="192.168.50.3"/>
+    <arg name="username"  value="admin"/>
+    <arg name="password"  value="ka3u1nfkr977"/>
+  </include>
+
 </launch>
 
 
