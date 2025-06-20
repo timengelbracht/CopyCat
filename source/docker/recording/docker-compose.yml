@@ -165,6 +165,7 @@ services:
       - "/dev/serial/by-id:/dev/serial/by-id"
       - "./zed_common.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/common.yaml"
       - "./spot_launch_full.launch:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/launch/spot_launch_full.launch"
+      - "./spot_launch_teleop.launch:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/launch/spot_launch_teleop.launch"
       - "./spot_record_full.sh:/catkin_ws/start_recording.sh"
       - "/mnt/nvme/tim_ws/teleop/haptic_msgs:/catkin_ws/src/haptic_msgs"
       - "/mnt/nvme/tim_ws/teleop/ROS-TCP-Endpoint:/catkin_ws/src/ROS-TCP-Endpoint"
