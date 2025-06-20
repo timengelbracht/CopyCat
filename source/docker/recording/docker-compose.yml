@@ -88,7 +88,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-nano
-    container_name: gripper_recording_nano
+    container_name: gripper_recording_nano 
     runtime: nvidia          # must stay
     network_mode: host
     privileged: true
@@ -121,6 +121,8 @@ services:
       - "/dev/serial/by-id:/dev/serial/by-id"
       - "./gripper_launch_single_force.launch:/catkin_ws/src/gripper_force_controller/launch/gripper_launch_single_force.launch"
       - "./zed_common.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/common.yaml"
+      - "./zedm.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zedm.yaml"
+      - "./zed2i.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zed2i.yaml"
       - "./gripper_record_single_bag_svo.sh:/catkin_ws/start_recording.sh"    
     stdin_open: true
     # entrypoint: ["/entrypoint-nano.sh"]

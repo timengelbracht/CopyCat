@@ -74,25 +74,25 @@ fi
 echo "[INFO] Starting rosbag recording…"
 rosbag record -O "${FULL_NAME}.bag" \
     --chunksize=8192 \
-    --buffsize=104857600 \
+    --buffsize=0 \
+    /diagnostics \
     /digit/left/image_raw \
     /digit/right/image_raw \
     /gripper_force_trigger \
-    /zedm/zed_node/imu/data_raw \
     /zedm/zed_node/imu/data \
+    /zedm/zed_node/imu/data_raw \
     /zedm/zed_node/odom \
     /zedm/zed_node/pose \
     /zedm/zed_node/pose_with_covariance \
     /zedm/zed_node/depth/depth_registered \
     /zedm/zed_node/left_raw/image_raw_color \
     /zedm/zed_node/right_raw/image_raw_color \
-    /zedm/zed_node/stereo_raw/image_raw_color \
     /tf \
-    /joint_states \
-    /force_torque/ft_sensor0/ft_sensor_readings/imu  \
+    /tf_static \
+    /dynamixel_workbench/dynamixel_state \
+    /dynamixel_workbench/joint_states \
     /force_torque/ft_sensor0/ft_sensor_readings/temperature \
     /force_torque/ft_sensor0/ft_sensor_readings/wrench \
-    /tf_static &
+    /force_torque/ft_sensor0/ft_sensor_readings/imu &
 ROSBAG_PID=$!
-
 wait "$ROSBAG_PID"
