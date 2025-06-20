@@ -2,14 +2,15 @@
 <launch>
 
   <!-- ZED SETTINGS -->
-  <arg name="zed_grab_rate"  default="30"/>
+  <arg name="zed_grab_rate"  default="25"/>
   <arg name="zed_imu_sync"   default="true"/>
   <arg name="zed_sync_mode"  default="2"/>
 
   <!-- DIGIT SETTINGS -->
-  <arg name="digit_left_id"  default="D21235"/>
-  <arg name="digit_right_id" default="D21228"/>
-  <arg name="digit_rate"     default="10"/>
+  <arg name="digit_left_id"  default="D21237"/>
+  <arg name="digit_right_id" default="D21236"/>
+  <arg name="digit_rate"     default="30"/>
+
 
   <!-- DYNAMIXEL -->
   <arg name="dxl_device"
@@ -20,7 +21,7 @@
 
   <!-- SERIAL (LOAD-CELL) -->
   <arg name="serial_port"
-       default="/dev/serial/by-id/usb-Arduino_LLC_Arduino_Nano_Every_1E4CCDEC515346354E202020FF113D46-if00"/>
+       default="/dev/serial/by-id/usb-Arduino_LLC_Arduino_Nano_Every_20224ADB515346354E202020FF113B19-if00"/>
   <arg name="serial_baud"    default="57600"/>
 
   <!-- ROKUBIMINI / ETHERCAT -->
@@ -49,15 +50,27 @@
   <param name="video/sync_mode"                value="$(arg zed_sync_mode)"/>
   <param name="sensors/sensors_timestamp_sync" value="$(arg zed_imu_sync)"/>
   </include>
-
+  
   <!-- 3  DIGIT sensors -->
+
+  <node pkg="gelsight_digit_ros" type="gelsight_dual_digit_node.py"
+        name="digit_dual_node" output="screen" required="true">
+    <param name="device_left_id"  value="$(arg digit_left_id)"/>
+    <param name="device_right_id" value="$(arg digit_right_id)"/>
+    <param name="left_topic_name" value="/digit/left/image_raw"/>
+    <param name="right_topic_name" value="/digit/right/image_raw"/>
+    <param name="publish_rate"    value="$(arg digit_rate)"/>
+    <param name="verbose"         value="0"/> <!-- Optional: set to 0 to silence logging -->
+  </node>
+
+  <!--
   <node pkg="gelsight_digit_ros" type="gelsight_digit_node.py"
         name="digit_left" output="screen" required="true">
     <param name="device_id"    value="$(arg digit_left_id)"/>
     <param name="node_name"    value="digit_left"/>
     <param name="topic_name"   value="/digit/left/image_raw"/>
     <param name="publish_rate" value="$(arg digit_rate)"/>
-  </node>
+  </node>  
 
   <node pkg="gelsight_digit_ros" type="gelsight_digit_node.py"
         name="digit_right" output="screen" required="true">
@@ -65,7 +78,7 @@
     <param name="node_name"    value="digit_right"/>
     <param name="topic_name"   value="/digit/right/image_raw"/>
     <param name="publish_rate" value="$(arg digit_rate)"/>
-  </node>
+  </node> -->
 
   <!-- 4  Dynamixel gripper -->
   <!--
