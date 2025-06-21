@@ -17,6 +17,7 @@
   <arg name="dxl_baud"       default="57600"/>
   <arg name="min_ticks"       default="106"/>
   <arg name="max_ticks"       default="190"/>
+  <arg name="telemetry_hz"       default="40"/>
 
   <!-- SERIAL (LOAD-CELL) -->
   <arg name="serial_port"
@@ -75,6 +76,7 @@
     <param name="baudrate_dxl" value="$(arg dxl_baud)"/>
     <param name="min_ticks" value="$(arg min_ticks)"/>
     <param name="max_ticks" value="$(arg max_ticks)"/>
+    <param name="telemetry_hz" value="$(arg telemetry_hz)"/>
   </node>
 
   <!-- 5  Load-cell via rosserial -->
