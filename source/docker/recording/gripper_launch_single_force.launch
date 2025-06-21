@@ -117,7 +117,7 @@
   <!-- 6  Rokubimini EtherCAT bus manager (all params scoped under /bus0) -->
   <node name="force_torque" pkg="rokubimini_ethercat"
         type="rokubimini_ethercat_bus_manager_node"
-        launch-prefix="ethercat_grant" output="screen" required="true">
+        launch-prefix="ethercat_grant" output="screen" respawn="true">
 
     <param name="num_spinners" type="int" value="1"/>
     <param name="ethercat_bus" value="$(arg ethercat_bus)"/>

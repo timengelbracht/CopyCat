@@ -106,8 +106,8 @@ services:
       - "/dev:/dev"
     environment:
       - DISPLAY=${DISPLAY}
-      - ROS_MASTER_URI=http://192.168.3.2:11311
-      - ROS_IP=192.168.3.2
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
       - UDEV=1
       - QT_X11_NO_MITSHM=1
       - NVIDIA_VISIBLE_DEVICES=all
@@ -124,6 +124,7 @@ services:
       - "./zedm.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zedm.yaml"
       - "./zed2i.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zed2i.yaml"
       - "./gripper_record_single_bag_svo.sh:/catkin_ws/start_recording.sh"    
+      - "./basic.yaml:/catkin_ws/src/dynamixel-workbench/dynamixel_workbench_controllers/config/basic.yaml"
     stdin_open: true
     # entrypoint: ["/entrypoint-nano.sh"]
     command: ["bash"]
