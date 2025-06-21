@@ -21,8 +21,8 @@ services:
       - WAYLAND_DISPLAY
       - __GLX_VENDOR_LIBRARY_NAME=nvidia
       - UDEV=1
-      - ROS_MASTER_URI=http://localhost:11311
-      - ROS_IP=127.0.0.1
+      - ROS_MASTER_URI=http://192.168.3.2:11311
+      - ROS_IP=192.168.3.2
     volumes:
       - /media/cvg/T7 Shield/spot-aria-recordings:/bags
       - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
@@ -59,8 +59,8 @@ services:
       - WAYLAND_DISPLAY
       - __GLX_VENDOR_LIBRARY_NAME=nvidia
       - UDEV=1
-      - ROS_MASTER_URI=http://localhost:11311
-      - ROS_IP=127.0.0.1
+      - ROS_MASTER_URI=http://192.168.3.2:11311
+      - ROS_IP=192.168.3.2
       - CUDA_HOME=/usr/local/cuda_host
       - CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda_host
       - LD_LIBRARY_PATH=/usr/local/cuda_host/lib64
@@ -88,6 +88,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-nano
+    container_name: gripper_recording_nano 
     runtime: nvidia          # must stay
     network_mode: host
     privileged: true
@@ -120,7 +121,10 @@ services:
       - "/dev/serial/by-id:/dev/serial/by-id"
       - "./gripper_launch_single_force.launch:/catkin_ws/src/gripper_force_controller/launch/gripper_launch_single_force.launch"
       - "./zed_common.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/common.yaml"
+      - "./zedm.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zedm.yaml"
+      - "./zed2i.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/zed2i.yaml"
       - "./gripper_record_single_bag_svo.sh:/catkin_ws/start_recording.sh"    
+      - "./basic.yaml:/catkin_ws/src/dynamixel-workbench/dynamixel_workbench_controllers/config/basic.yaml"
     stdin_open: true
     # entrypoint: ["/entrypoint-nano.sh"]
     command: ["bash"]
@@ -129,6 +133,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile-agx-orin-spot
+    container_name: spot_recording_agx
     runtime: nvidia         
     network_mode: host
     privileged: true
@@ -146,23 +151,27 @@ services:
       - "/dev:/dev"
     environment:
       - DISPLAY=${DISPLAY}
-      - ROS_MASTER_URI=http://localhost:11311
-      - ROS_IP=127.0.0.1
+      - ROS_MASTER_URI=http://192.168.3.2:11311
+      - ROS_IP=192.168.3.2
       - UDEV=1
       - QT_X11_NO_MITSHM=1
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - ZED_SDK_SVO_VERSION=1
     volumes:
-      - /ssd:/ssd
+      - /mnt/nvme:/ssd
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /run/udev:/run/udev:ro
       - "/dev/bus/usb:/dev/bus/usb"
       - "/dev/serial/by-id:/dev/serial/by-id"
-      - "./gripper_launch_single_force.launch:/catkin_ws/src/gripper_force_controller/launch/gripper_launch_single_force.launch"
       - "./zed_common.yaml:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/params/common.yaml"
-      - "./gripper_record_single_bag_svo.sh:/catkin_ws/start_recording.sh"
-      - "./dual.launch:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/launch/dual.launch"
+      - "./spot_launch_full.launch:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/launch/spot_launch_full.launch"
+      - "./spot_launch_teleop.launch:/catkin_ws/src/zed-ros-wrapper/zed_wrapper/launch/spot_launch_teleop.launch"
+      - "./spot_record_full.sh:/catkin_ws/start_recording.sh"
+      - "/mnt/nvme/tim_ws/teleop/haptic_msgs:/catkin_ws/src/haptic_msgs"
+      - "/mnt/nvme/tim_ws/teleop/ROS-TCP-Endpoint:/catkin_ws/src/ROS-TCP-Endpoint"
+      - "/mnt/nvme/tim_ws/teleop/teleop_tools:/catkin_ws/src/teleop_tools"
+      - "/mnt/nvme/tim_ws/spot_ros:/catkin_ws/src/spot_ros"
     stdin_open: true
     command: ["bash"]
     tty: true
@@ -186,8 +195,8 @@ services:
       - WAYLAND_DISPLAY
       - __GLX_VENDOR_LIBRARY_NAME=nvidia
       - UDEV=1
-      - ROS_MASTER_URI=http://localhost:11311
-      - ROS_IP=127.0.0.1
+      - ROS_MASTER_URI=http://192.168.3.2:11311
+      - ROS_IP=192.168.3.2
     volumes:
       - /media/cvg/T7 Shield/spot-aria-recordings:/bags  
       - "/tmp/.X11-unix:/tmp/.X11-unix:rw"

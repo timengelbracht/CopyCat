@@ -82,7 +82,7 @@ RUN apt-get update && apt-get install -y \
     ros-noetic-teleop-twist-joy \
     ros-noetic-interactive-marker-twist-server \
     ros-noetic-twist-mux
-RUN pip3 install transforms3d
+RUN pip3 install transforms3d scipy roma torch 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Build ROS workspace with catkin_tools
 # ─────────────────────────────────────────────────────────────────────────────

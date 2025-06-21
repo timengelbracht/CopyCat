@@ -12,5 +12,5 @@ sudo sysctl -w net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -o ${SPOT_IFACE} -j MASQUERADE
 sudo iptables -A FORWARD -i ${SPOT_IFACE} -o ${ORIN_IFACE} -m state --state RELATED,ESTABLISHED -j ACCEPT
 sudo iptables -A FORWARD -i ${ORIN_IFACE} -o ${SPOT_IFACE} -j ACCEPT
-echo "[✅] NAT forwarding rules set on NUC."
+echo "NAT forwarding rules set on NUC."
 EOF
