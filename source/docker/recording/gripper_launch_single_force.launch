@@ -9,7 +9,7 @@
   <!-- DIGIT SETTINGS -->
   <arg name="digit_left_id"  default="D21237"/>
   <arg name="digit_right_id" default="D21236"/>
-  <arg name="digit_rate"     default="30"/>
+  <arg name="digit_rate"     default="20"/>
 
 
   <!-- DYNAMIXEL -->
@@ -17,7 +17,7 @@
        default="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT94ELAD-if00-port0"/>
   <arg name="dxl_baud"       default="57600"/>
   <arg name="min_ticks"       default="106"/>
-  <arg name="max_ticks"       default="190"/>
+  <arg name="max_ticks"       default="197"/>
 
   <!-- SERIAL (LOAD-CELL) -->
   <arg name="serial_port"
@@ -117,7 +117,7 @@
   <!-- 6  Rokubimini EtherCAT bus manager (all params scoped under /bus0) -->
   <node name="force_torque" pkg="rokubimini_ethercat"
         type="rokubimini_ethercat_bus_manager_node"
-        launch-prefix="ethercat_grant" output="screen" respawn="true">
+        launch-prefix="ethercat_grant" output="screen" required="true">
 
     <param name="num_spinners" type="int" value="1"/>
     <param name="ethercat_bus" value="$(arg ethercat_bus)"/>
