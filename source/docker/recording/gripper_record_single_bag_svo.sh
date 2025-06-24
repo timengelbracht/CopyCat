@@ -75,7 +75,6 @@ echo "[INFO] Starting rosbag recording…"
 rosbag record -O "${FULL_NAME}.bag" \
     --chunksize=8192 \
     --buffsize=1024 \
-    --udp \
     /digit/left/image_raw \
     /digit/right/image_raw \
     /gripper_force_trigger \
