@@ -32,13 +32,18 @@ class DataLoader:
             elif kind == "gripper":
                 extractor.extract_bag()
             elif kind == "iphone":
-                extractor.extract_data()
+                extractor.extract_rgbd()
+                extractor.extract_plys()
+                extractor.extract_poses()
 
     def detect_qr_all(self):
         for modality in self.modalities:
             kind = modality.split("_")[0]
             label_rgb = self.labels[kind]
-            ext = self.extensions[kind]
+            if kind == "iphone":
+                ext = ".jpg"
+            else:
+                ext = self.extensions[kind]
             frame_dir = self.base_path / "extracted" / self.rec_name / modality / label_rgb.strip("/")
 
             print(f"\n[⇨] Detecting QR in {modality}...")
@@ -77,7 +82,10 @@ class DataLoader:
         print("\n[⇨] Overwriting extracted timestamps to match Aria:")
         for modality, delta in self.deltas.items():
             kind = modality.split("_")[0]
-            ext = self.extensions[kind]
+            if kind == "iphone":
+                ext = ".jpg"
+            else:
+                ext = self.extensions[kind]
             base_dir = self.base_path / "extracted" / self.rec_name / modality
             print(f"    Applying delta to {modality}: {delta:+} ns")
 
@@ -90,6 +98,10 @@ class DataLoader:
                 if depth_dir.exists():
                     self.apply_delta_to_images(depth_dir, delta, ".exr")
 
+                ply_dir = base_dir / "points"
+                if ply_dir.exists():
+                    self.apply_delta_to_images(ply_dir, delta, ".ply")
+
             for subdir in base_dir.rglob("*"):
                 csv_file = subdir / "data.csv"
                 if csv_file.exists():
@@ -100,7 +112,10 @@ class DataLoader:
 
     def get_min_max_timestamp(self, modality: str) -> tuple[int, int]:
         kind = modality.split("_")[0]
-        ext = self.extensions[kind]
+        if kind == "iphone":
+            ext = ".jpg"
+        else:
+            ext = self.extensions[kind]
         base_dir = self.base_path / "extracted" / self.rec_name / modality
         all_ts = []
 
@@ -138,13 +153,14 @@ class DataLoader:
 
             for img_dir in base_dir.rglob("*"):
                 if img_dir.is_dir():
-                    for f in img_dir.glob(f"*{ext}"):
-                        try:
-                            ts = int(f.stem)
-                            if ts < min_t or ts > max_t:
-                                f.unlink()
-                        except:
-                            continue
+                    for f in img_dir.glob("*"):
+                        if f.suffix.lower() in ext:
+                            try:
+                                ts = int(f.stem)
+                                if ts < min_t or ts > max_t:
+                                    f.unlink()
+                            except:
+                                continue
 
             for csv_file in base_dir.rglob("data.csv"):
                 try:
@@ -170,17 +186,17 @@ class DataLoader:
 if __name__ == "__main__":
     
     manager = DataLoader(
-        rec_name="door_6",
-        base_path=Path("/bags/spot-aria-recordings/dlab_recordings"),
-        modalities=["aria_human_ego", "gripper_right", "iphone_left"],
+        rec_loc="bedroom_1",
+        base_path=Path("/data/ikea_recordings"),
+        modalities=["aria_human_ego", "aria_gripper_ego", "gripper_right", "iphone_left"],
         extractors={"aria": AriaData, "gripper": GripperData, "iphone": IPhoneData},
         labels={"aria": "/camera_rgb", "gripper": "/zedm/zed_node/left/image_rect_color", "iphone": "/camera_rgb"},
-        extensions={"aria": ".png", "gripper": ".png", "iphone": ".jpg"},
+        extensions={"aria": ".png", "gripper": ".png", "iphone": (".jpg", ".exr", "ply")},
     )
 
-    manager.extract_all()
+    # manager.extract_all()
     manager.detect_qr_all()
     manager.align_to_aria()
-    manager.update_timestamps()
-    manager.crop_to_shared_window()
-    manager.extract_video_all()
+    # manager.update_timestamps()
+    # manager.crop_to_shared_window()
+    # manager.extract_video_all()

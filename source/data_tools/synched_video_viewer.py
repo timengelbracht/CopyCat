@@ -7,13 +7,17 @@ import cv2, numpy as np
 # 1.  ROOT FOLDER AND BASE STREAMS ********************************** #
 # ------------------------------------------------------------------ #
 SYNCED_DIR = Path("/bags/spot-aria-recordings/dlab_recordings/extracted/door_6")
+SAVE_VIDEO = True
+OUT_PATH = SYNCED_DIR / "multistream_mosaic.mp4"
+VIDEO_FPS = 120
+video_writer = None
 
 BASE_STREAMS = {
     "aria_rgb"   : SYNCED_DIR / "aria_human_ego/camera_rgb/data.mp4",
     "zed_right"  : SYNCED_DIR / "gripper_right/zedm/zed_node/right/image_rect_color/data.mp4",
     "digit_right": SYNCED_DIR / "gripper_right/digit/right/image_raw/data.mp4",
     "iphone_rgb" : SYNCED_DIR / "iphone_left/camera_rgb/data.mp4",
-    "depth"      : SYNCED_DIR / "gripper_right/zedm/zed_node/depth/depth_registered/data.mp4",
+
 }
 
 # ------------------------------------------------------------------ #
@@ -79,6 +83,7 @@ cv2.resizeWindow(WINDOW_NAME, FRAME_SIZE[0]*cols, FRAME_SIZE[1]*rows)
 # ------------------------------------------------------------------ #
 # 6.  MAIN LOOP ***************************************************** #
 # ------------------------------------------------------------------ #
+
 t0, order = time.time(), list(VIDEO_PATHS.keys())
 while True:
     now = time.time() - t0
@@ -101,12 +106,28 @@ while True:
     if all(ended.values()):
         break
 
-    cv2.imshow(WINDOW_NAME,
-               mosaic([last_frame[k] for k in order], rows, cols))
+    mosaic_frame = mosaic([last_frame[k] for k in order], rows, cols)
+    cv2.imshow(WINDOW_NAME, mosaic_frame)
+
+    # initialize writer once
+    if SAVE_VIDEO and video_writer is None:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        h, w = mosaic_frame.shape[:2]
+        video_writer = cv2.VideoWriter(str(OUT_PATH), fourcc, VIDEO_FPS, (w, h))    
+
+        # write frame
+    if SAVE_VIDEO:
+        video_writer.write(mosaic_frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
     time.sleep(0.001)
 
 for cap in caps.values(): cap.release()
 cv2.destroyAllWindows()
+
+if SAVE_VIDEO and video_writer is not None:
+    video_writer.release()
+    print(f"[✓] Saved mosaic video to: {OUT_PATH}")
+
 print("Done.")

@@ -11,7 +11,7 @@ import json
 
 
 class LeicaData:
-    def __init__(self, base_path: Path, scan_idx: int = 0, voxel: float = 0.02*6,):
+    def __init__(self, base_path: Path, scan_idx: int = 0, voxel: float = 0.05,):
     
         self.base_path = base_path
         self.e57_pre = base_path / "raw" / "Leica" / "e57" / "dlab_pre.e57"
@@ -31,29 +31,27 @@ class LeicaData:
         stem_pre = self.e57_pre.stem + f"_scan{scan_idx}"
         self.ply_pre_path = self.pre_cache_dir / "points" / f"{stem_pre}.ply"
         self.down_pre_path = self.pre_cache_dir / "points_downsampled" / f"{stem_pre}_voxel{voxel:.3f}.ply"
-        self.fpfh_pre_path = self.pre_cache_dir / "features_fpfh" / f"{stem_pre}_voxel{voxel:.3f}_fpfh.npz"
         self.renderings_pre_path = self.pre_cache_dir / "renderings" / f"{stem_pre}"
         self.features_2D_pre_path = self.pre_cache_dir / "renderings" / "features_2D"
 
         stem_post = self.e57_pre.stem + f"_scan{scan_idx}"
         self.ply_post_path = self.post_cache_dir / "points" / f"{stem_post}.ply"
         self.down_post_path = self.post_cache_dir / "points_downsampled" / f"{stem_post}_voxel{voxel:.3f}.ply"
-        self.fpfh_post_path = self.post_cache_dir / "features_fpfh" / f"{stem_post}_voxel{voxel:.3f}_fpfh.npz"
         self.renderings_post_path = self.post_cache_dir / "renderings" 
         self.features_2D_post_path = self.post_cache_dir / "renderings" 
 
         for path in [
             self.ply_pre_path,
             self.down_pre_path,
-            self.fpfh_pre_path,
             self.ply_post_path,
             self.down_post_path,
-            self.fpfh_post_path,
         ]:
             path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._e57_to_ply(scan="pre")
-        self._e57_to_ply(scan="post")
+        self._points_raw_to_ply(scan="pre")
+        self._points_raw_to_ply(scan="post")
+
+        
         
     def get_full_cloud(self, scan: str, force: bool = False) -> o3d.geometry.PointCloud:
         """Return the full-resolution cloud, converting from E57 if needed."""
@@ -68,7 +66,7 @@ class LeicaData:
             self.ply_path = self.ply_post_path
 
         if not self.ply_path.exists() or force:
-            self._e57_to_ply()
+            self._points_raw_to_ply()
         return o3d.io.read_point_cloud(str(self.ply_path))
     
     def get_downsampled(self, scan: str, force: bool = False) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
@@ -89,7 +87,7 @@ class LeicaData:
         down = o3d.io.read_point_cloud(str(down_path))
         return down
 
-    def _e57_to_ply(self, scan: str) -> None:
+    def _points_raw_to_ply(self, scan: str) -> None:
 
         if scan not in ["pre", "post"]:
             raise ValueError("Scan must be either 'pre' or 'post'.")
@@ -278,11 +276,10 @@ if __name__ == "__main__":
     from pathlib import Path
 
     # Example usage
-    base_path = Path(f"/bags/spot-aria-recordings/dlab_recordings")
+    base_path = Path(f"/data/dlab_recordings")
 
 
     leica_data = LeicaData(base_path)
 
-    # pcd_pre_down, fpfh_pre = leica_data.get_down_and_fpfh(scan="pre")
     # leica_data._make_rendered_360_views(scan="pre")
     leica_data.make_rendered_360_views(scan="post")

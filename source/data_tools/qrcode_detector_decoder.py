@@ -3,6 +3,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from time_aligner import TimeAligner
+from typing import List, Tuple
 
 class QRCodeDetectorDecoder:
     def __init__(self, frame_dir: Path, ext=".jpg"):
@@ -12,6 +13,7 @@ class QRCodeDetectorDecoder:
         # self.frame_index_at_detection = None
         # self.frame_timestamp_at_detection = None
         # self.qr_timestamp_at_detection = None
+        self.logging_tag = f"[{self.__class__.__name__}]"
 
     def parse_gopro_qr(self, qr_text: str) -> int:
 
@@ -55,19 +57,56 @@ class QRCodeDetectorDecoder:
             if img is None:
                 continue
 
-            val, points, _ = self.qr.detectAndDecode(img)
-            if val:
-                try:
-                    timestamp_ns = self.parse_gopro_qr(val)
-                except ValueError as e:
-                    print(f"[!] Failed to parse QR code: {e}")
-                    continue
+            # val, points, _ = self.qr.detectAndDecode(img)
+            retval_detect, points = self.qr.detect(img)
+            if retval_detect and points is not None and cv2.contourArea(points) > 0:
+                retval_decode, _ = self.qr.decode(img, points)
+                if retval_decode != "":
+                    try:
+                        timestamp_ns = self.parse_gopro_qr(retval_decode)
+                    except ValueError as e:
+                        print(f"[!] Failed to parse QR code: {e}")
+                        continue
 
-                print(f"[INFO] Found valid QR in: {frame_path.name} → {timestamp_ns} ns")
-                #               (device_time, utc_time)
-                return (int(frame_path.stem), timestamp_ns)
+                    print(f"[{self.logging_tag}] Found valid QR in: {frame_path.name} → {timestamp_ns} ns")
+                    #               (device_time, utc_time)
+                    return (int(frame_path.stem), timestamp_ns)
 
         raise RuntimeError("No valid QR code found in the stream.")
+    
+    def find_all_valid_interaction_qrs(self, qr_decoded_text: str, min_rel_area: float = 0.15) -> List[tuple[int, int]]:
+        """
+        Find all valid QR codes in the frame directory that match the specified decoded text pattern.
+        Returns a list of tuples (frame_index, timestamp_ns).
+
+        :param qr_decoded_text: The text pattern to match against the decoded QR codes.
+        :param min_rel_area: Minimum relative area of the QR code contour to consider it valid. 
+        """
+        all_qrs = []
+        frame_files = sorted(self.frame_dir.glob(f"*{self.ext}"), key=lambda p: int(p.stem))
+
+        h, w = cv2.imread(str(frame_files[0])).shape[:2]
+        min_area = min_rel_area * h * w
+
+        for frame_path in frame_files:
+            img = cv2.imread(str(frame_path))
+            if img is None:
+                continue
+
+            retval_detect, points = self.qr.detect(img)
+            if retval_detect and points is not None and cv2.contourArea(points) > min_area:
+                retval_decode, _ = self.qr.decode(img, points)
+                if retval_decode != "":
+                    try:
+                        timestamp_ns = self.parse_gopro_qr(retval_decode)
+                    except ValueError as e:
+                        print(f"[!] Failed to parse QR code: {e}")
+                        continue
+
+                    print(f"[{self.logging_tag}] Found valid QR in: {frame_path.name} → {timestamp_ns} ns")
+                    all_qrs.append((int(frame_path.stem), timestamp_ns))
+
+        return all_qrs
 
 
 if __name__ == "__main__":

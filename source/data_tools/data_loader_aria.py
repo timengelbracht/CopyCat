@@ -14,36 +14,46 @@ import os
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 import json
+from utils import ensure_dir, save_image, clean_label, estimate_fps, load_sorted_images, is_valid_image
+from mps_request import MPSClient
+from data_preproc import RecordingIndex
 
 class AriaData:
-    def __init__(self, base_path: Path, rec_name: str, sensor_module_name: str, voxel: float = 0.02*6):
+
+    def __init__(self, base_path: Path, 
+                 rec_loc: str, 
+                 rec_type: str, 
+                 rec_module: str, 
+                 interaction_indices: str,
+                 data_indexer: Optional[RecordingIndex] = None,
+                 voxel: float = 0.02*6):
 
         self.voxel = voxel
 
-        self.rec_name = rec_name
+        self.rec_loc = rec_loc
         self.base_path = base_path
-        self.sensor_module_name = sensor_module_name
+        self.rec_module = rec_module
+        self.rec_type = rec_type
+        self.interaction_indices = interaction_indices
 
-        self.mps_path_raw = self.base_path / "raw" / self.rec_name / self.sensor_module_name / f"mps_gripper_recording_sync_{rec_name}_vrs"
-        self.vrs_file_raw = self.base_path / "raw" / self.rec_name / self.sensor_module_name / f"gripper_recording_sync_{rec_name}.vrs"
-        self.extraction_path = self.base_path / "extracted" / self.rec_name / self.sensor_module_name
+        self.extraction_path = self.base_path / "extracted" / self.rec_loc / self.rec_type / self.rec_module / f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}_vrs"
+
+        self.mps_path_raw = self.base_path / "raw" / self.rec_loc / self.rec_type / self.rec_module / f"mps_{self.rec_loc}_{self.interaction_indices}_{self.rec_type}_vrs"
+        self.vrs_file_raw = self.base_path / "raw" / self.rec_loc / self.rec_type / self.rec_module / f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}.vrs"
+        self.mps_path_raw_all_devices = self.base_path / "raw" / self.rec_loc / "mps_all_devices"
 
         self.label_rgb = f"/camera_rgb"
         self.label_rgb_raw = f"/camera_rgb_raw"
         self.label_slam = f"/slam"
-        self.label_features = f"/keyframes/features"
-        self.label_features_raw = f"/keyframes_raw/features"
         self.label_keyframes = f"/keyframes/rgb"
         self.label_keyframes_raw = f"/keyframes_raw/rgb"
 
         self.label_clt = f"{self.label_slam}/closed_loop_trajectory"
         self.label_sdp = f"{self.label_slam}/semidense_points"
-        self.label_fpfh = f"{self.label_slam}/fpfh"
         self.label_sdpd = f"{self.label_slam}/semidense_points_downsampled"
 
         self.semidense_points_ply_path = self.extraction_path / self.label_sdp.strip("/") / "data.ply"
         self.semidense_points_downsampled_ply_path = self.extraction_path / self.label_sdpd.strip("/") / "data.ply"
-        self.fpfh_path = self.extraction_path / self.label_fpfh.strip("/") / "data.npz"
         self.visual_registration_output_path = self.extraction_path / "visual_registration"
 
         self.device_calib = None
@@ -56,6 +66,10 @@ class AriaData:
         self.extracted_vrs_raw = Path(self.extraction_path / self.label_rgb_raw.strip("/")).exists()
         self.extracted_mps = Path(self.extraction_path / self.label_slam.strip("/")).exists()
         self.time_aligned = False        
+
+        self.data_indexer = data_indexer
+
+        self.logging_tag = f"{self.rec_loc}_{self.rec_type}_{self.rec_module}".upper()
 
     def load_provider(self):
         if not self.vrs_file_raw.exists():
@@ -124,13 +138,60 @@ class AriaData:
 
             return clb
         
+    def request_mps(self, force: bool = False) -> None:
+
+        if self.mps_path_raw.exists() and not force:
+            print(f"[{self.logging_tag}] MPS data already exists at {self.mps_path_raw}")
+            return
+        
+        if not self.vrs_file_raw.exists():
+            raise FileNotFoundError(f"VRS file not found: {self.vrs_file_raw}")
+        
+        print(f"[{self.logging_tag}] Requesting MPS data from {self.vrs_file_raw}")
+
+        mps_client = MPSClient()
+        try: # will prompt for credentials
+            mps_client.request_single(
+                input_path=str(self.vrs_file_raw),
+                features=["SLAM", "HAND_TRACKING", "EYE_GAZE"],
+                force=force,
+                no_ui=True
+            )
+            print(f"[{self.logging_tag}] MPS data requested successfully")
+        except Exception as e:
+            print(f"[{self.logging_tag}] Failed to request MPS data: {e}")
+
+    def request_mps_all_devices(self, force: bool = False) -> None:
+
+        mps_client = MPSClient()
+
+        if self.mps_path_raw_all_devices.exists() and not force:
+            print(f"[{self.logging_tag}] MPS data for all devices already exists at {self.mps_path_raw_all_devices}")
+            return
+
+        all_vrs_files = self.data_indexer.vrs_files(
+            location=self.rec_loc
+        )
+
+        # try:
+        mps_client.request_multi(
+            input_paths=all_vrs_files,
+            output_dir=self.mps_path_raw_all_devices,
+            force=force,
+            no_ui=True
+        )
+        print(f"[{self.logging_tag}] MPS data requested successfully")
+        # except Exception as e:
+        #     print(f"[{self.logging_tag}] Failed to request MPS data: {e}")
+
+
     def extract_vrs(self, undistort: bool = True):
 
         if undistort and self.extracted_vrs:
-            print(f"[!] VRS data already extracted to {self.extraction_path}")
+            print(f"[{self.logging_tag}] VRS data already extracted to {self.extraction_path}")
             return
         if not undistort and self.extracted_vrs_raw:
-            print(f"[!] VRS data already extracted to {self.extraction_path}")
+            print(f"[{self.logging_tag}] VRS data already extracted to {self.extraction_path}")
             return
 
         if not self.vrs_file_raw:
@@ -143,7 +204,7 @@ class AriaData:
             out_dir = self.extraction_path / self.label_rgb.strip("/")
             self.extracted_vrs = True
 
-        out_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(out_dir)
 
         calib = self.device_calib.get_camera_calib("camera-rgb")
         # pinhole = calibration.get_linear_camera_calibration(512, 512, 150)
@@ -155,7 +216,7 @@ class AriaData:
         pinhole = calibration.get_linear_camera_calibration(w, h, f)
         # pinhole_rot = calibration.rotate_camera_calib_cw90deg(pinhole)
 
-        print(f"[INFO] Data provider created successfully")
+        print(f"[{self.logging_tag}] Data provider created successfully")
         stream_id = self.provider.get_stream_id_from_label("camera-rgb")
 
         for i in tqdm(range(0, self.provider.get_num_data(stream_id)), total=self.provider.get_num_data(stream_id)):
@@ -170,12 +231,12 @@ class AriaData:
             image_array= cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)            
             cv2.imwrite(str(out_file), image_array)
 
-        print(f"[✓] Saved RGB images to {out_dir}")
+        print(f"[{self.logging_tag}] Saved RGB images to {out_dir}")
 
     def extract_mps(self):
 
         if self.extracted_mps:
-            print(f"[!] MPS data already extracted to {self.extraction_path}")
+            print(f"[{self.logging_tag}] MPS data already extracted to {self.extraction_path}")
             return
 
         # Path to closed loop SLAM trajectory
@@ -185,13 +246,13 @@ class AriaData:
         try:
             df = pd.read_csv(closed_loop_trajectory_file)
         except Exception as e:
-            print(f"[!] Failed to read CSV {closed_loop_trajectory_file}: {e}")
+            print(f"[{self.logging_tag}] Failed to read CSV {closed_loop_trajectory_file}: {e}")
             return
         
         try:
             df_pts = pd.read_csv(semidense_points_file, compression='gzip')
         except Exception as e:
-            print(f"[!] Failed to read CSV {semidense_points_file}: {e}")
+            print(f"[{self.logging_tag}] Failed to read CSV {semidense_points_file}: {e}")
             return
 
         # Normalize to 'timestamp' naming
@@ -202,24 +263,24 @@ class AriaData:
         # Save to extracted location
         label_clt = f"{self.label_slam}/closed_loop_trajectory"
         csv_dir = self.extraction_path / label_clt.strip("/")
-        csv_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(csv_dir)
         df.to_csv(csv_dir / "data.csv", index=False)
 
-        print(f"[✓] Saved closed loop trajectory CSV: {csv_dir}/data.csv")
+        print(f"[{self.logging_tag}] Saved closed loop trajectory CSV: {csv_dir}/data.csv")
 
         label_sdp = f"{self.label_slam}/semidense_points"
         csv_dir = self.extraction_path / label_sdp.strip("/")
-        csv_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(csv_dir)
         df_pts.to_csv(csv_dir / "data.csv", index=False)
 
-        print(f"[✓] Saved semidense points CSV: {csv_dir}/data.csv")
+        print(f"[{self.logging_tag}] Saved semidense points CSV: {csv_dir}/data.csv")
 
         # TODO - add more mps data extraction as needed
         # TODO - UTC timestamp is NOT changed at the moment, only device timestamp!!!!
         
         # Update extracted flag
         self.extracted_mps = True
-        print(f"[✓] Extracted MPS data to {csv_dir}")
+        print(f"[{self.logging_tag}] Extracted MPS data to {csv_dir}")
 
     def extract_video(self, out_dir: Optional[str | Path] = None, undistort: bool = True) -> None:
         """
@@ -244,7 +305,7 @@ class AriaData:
         avg_dt = np.mean(time_diffs)  # average nanosecond difference
         fps = 1e9 / avg_dt  # frames per second
 
-        print(f"Estimated fps: {fps:.2f}")
+        print(f"[{self.logging_tag}] Estimated fps: {fps:.2f}")
 
         # Initialize video writer
         frame = cv2.imread(os.path.join(out_dir, images[0]))
@@ -259,7 +320,7 @@ class AriaData:
 
         video.release()
 
-        print(f"[✓] Saved video to {out_dir}")
+        print(f"[{self.logging_tag}] Saved video to {out_dir}")
 
     def extract_keyframes(self, undistort: bool = False, only_first_frame: bool = True) -> None:
         """
@@ -268,10 +329,10 @@ class AriaData:
         """
 
         if not self.extracted_vrs:
-            raise FileNotFoundError(f"VRS data not extracted to {self.extraction_path}")
+            raise FileNotFoundError(f"[{self.logging_tag}] VRS data not extracted to {self.extraction_path}")
         
         if not self.extracted_mps:
-            raise FileNotFoundError(f"MPS data not extracted to {self.extraction_path}")
+            raise FileNotFoundError(f"[{self.logging_tag}] MPS data not extracted to {self.extraction_path}")
 
         if undistort:
             in_dir = self.extraction_path / self.label_rgb.strip("/")
@@ -280,11 +341,11 @@ class AriaData:
             in_dir = self.extraction_path / self.label_rgb_raw.strip("/")
             out_dir = self.visual_registration_output_path / self.label_keyframes_raw.strip("/")
 
-        out_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(out_dir)
 
         # get first mps pose timestamp as it takes some time to initialize
         # i.e. the first frame might not have a pose yet
-        mps_traj = self.closed_loop_trajectory()
+        mps_traj = self.get_closed_loop_trajectory()
         time_zero = mps_traj["timestamp"].iloc[0]
 
         # Get sorted list of image files (assumes naming like 0.png, 1.png, ...)
@@ -302,13 +363,13 @@ class AriaData:
                 (out_dir / f"{image_files_valid[0].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
         else:
             L = len(image_files_valid)
-            indices = np.linspace(0, L - 1, num=min(10, L), dtype=int)
+            indices = np.linspace(0, L - 1, num=min(15, L), dtype=int)
             for i in indices:
                 img = cv2.imread(str(image_files_valid[i]))
                 if img is not None:
                     (out_dir / f"{image_files_valid[i].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
 
-    def closed_loop_trajectory(self) -> Optional[pd.DataFrame]:
+    def get_closed_loop_trajectory(self) -> pd.DataFrame:
         """
         Returns the closed loop trajectory as a pandas DataFrame.
         """
@@ -337,12 +398,12 @@ class AriaData:
         """Return the full-resolution cloud, converting from E57 if needed."""
 
         if not self.semidense_points_ply_path.exists() or force:
-            self._semidense_points_to_ply()
+            self._points_raw_to_ply()
         return o3d.io.read_point_cloud(str(self.semidense_points_ply_path))
     
     def get_downsampled(self, force: bool = False) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
         """
-        Returns (downsampled_cloud, FPFH_features).  Caches both to disk.
+        Returns downsampled_cloud.  Caches both to disk.
         """
 
         if force or not (self.semidense_points_downsampled_ply_path.exists()):
@@ -354,7 +415,7 @@ class AriaData:
     
     def get_mps_pose_at_timestamp(self, timestamp: int) -> Optional[np.ndarray]:
         
-        trajectory_df = self.closed_loop_trajectory()
+        trajectory_df = self.get_closed_loop_trajectory()
         if trajectory_df is None:
             print(f"[!] No closed loop trajectory data found. re-extract MPS data.")
             return None
@@ -421,7 +482,7 @@ class AriaData:
         # TODO - add more mps data extraction as needed
         # TODO interpolate pose between timestamps if needed
 
-    def get_transform_world_aria(self) -> np.ndarray:
+    def get_transform_world_query(self) -> np.ndarray:
         """
         Returns the transform from world to device coordinates.
         """
@@ -436,7 +497,7 @@ class AriaData:
 
         return self.T_wq
 
-    def _semidense_points_to_ply(self, voxel: float | None = None) -> None:
+    def _points_raw_to_ply(self, voxel: float | None = None) -> None:
         """
         Converts the semidense points DataFrame to a PLY file.
         """
@@ -459,29 +520,24 @@ class AriaData:
             o3d.io.write_point_cloud(str(self.semidense_points_ply_path), pcd, write_ascii=False)
             pbar.update(1)        
         
-        print(f"[Aria] Saved full-resolution PLY → {self.semidense_points_ply_path}")
+        print(f"[{self.logging_tag}] Saved full-resolution PLY → {self.semidense_points_ply_path}")
 
     def _make_downsampled(self) -> None:
         """
         Down-sample the semidense points.
         """
 
-        if not self.semidense_points_downsampled_ply_path.parent.exists():
-            self.semidense_points_downsampled_ply_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(self.semidense_points_downsampled_ply_path.parent)
 
-        if self.semidense_points_downsampled_ply_path.exists() and self.fpfh_path.exists():
-            print(f"[Aria] Downsampled cloud already exist at {self.semidense_points_downsampled_ply_path} and {self.fpfh_path}")
-            return
-
-        print(f"[Aria] Loading semidense points...")
+        print(f"[{self.logging_tag}] Loading semidense points...")
         full = self.get_semidense_points_pcd()  # ensures .ply exists
 
-        with tqdm(total=4, desc="[Aria] Downsample", unit="step") as pbar:
-            print(f"[Aria] Down-sampling at voxel={self.voxel:.3f}")
+        with tqdm(total=4, desc="[{self.logging_tag}] Downsample", unit="step") as pbar:
+            print(f"[{self.logging_tag}] Down-sampling at voxel={self.voxel:.3f}")
             down = full.voxel_down_sample(voxel_size=self.voxel)
             pbar.update(1)
 
-            print("[Aria] Estimating normals...")
+            print("[{self.logging_tag}] Estimating normals...")
             down.estimate_normals(
                 o3d.geometry.KDTreeSearchParamHybrid(
                     radius=self.voxel * 2.0, max_nn=30
@@ -489,36 +545,55 @@ class AriaData:
             )
             pbar.update(1)
 
-            print("[Aria] Saving downsampled cloud..") # stored in PLY comment
+            print("[{self.logging_tag}] Saving downsampled cloud..") # stored in PLY comment
             o3d.io.write_point_cloud(str(self.semidense_points_downsampled_ply_path), down, write_ascii=False)
             pbar.update(1)
 
         print(
-            f"[Aria] Cached ↓ cloud → {self.semidense_points_downsampled_ply_path.name}"
+            f"[{self.logging_tag}] Cached ↓ cloud → {self.semidense_points_downsampled_ply_path.name}"
         )
 
 
 if __name__ == "__main__":
 
     # Example usage
-    rec_name = "door_6"
-    base_path = Path(f"/bags/spot-aria-recordings/dlab_recordings")
-    sensor_module_name = "aria_human_ego"
 
-    aria_data = AriaData(base_path, rec_name, sensor_module_name)
+    rec_location = "bedroom_1"
+    base_path = Path(f"/data/ikea_recordings")
+    # rec_type_aria = "gripper"
+    # rec_module = "aria_gripper"
+    # interaction_indices = "1-8"
+    
+    data_indexer = RecordingIndex(
+        os.path.join(str(base_path), "raw") 
+    )
+
+    aria_queries_at_loc = data_indexer.query(
+        location=rec_location, 
+        interaction=None, 
+        recorder="aria*"
+    )
+
+    for loc, inter, rec, ii, path in aria_queries_at_loc:
+        print(f"Found recorder: {rec} at {path}")
+
+        rec_type = inter
+        rec_module = rec
+        interaction_indices = ii
+
+        aria_data = AriaData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+
+        aria_data.request_mps(force=False)
+        # aria_data.extract_vrs(undistort=False)
+        aria_data.extract_vrs(undistort=True)
+
+        aria_data.extract_mps()
+
+    # aria_data.request_mps_all_devices(force=True)
 
 
-    # aria_data.extract_vrs()
-    # aria_data.extract_vrs(undistort=True)
-    # aria_data.extract_video()
-    # aria_data.extract_video(undistort=True)
 
-    # aria_data.extract_mps()
-
-    # aria_data.get_down_and_fpfh()
-
-
-    aria_data.extract_keyframes()
-    aria_data.extract_keyframes(undistort=True)
+    # aria_data.extract_keyframes()
+    # aria_data.extract_keyframes(undistort=True, only_first_frame=False)
     # aria_data.get_mps_pose_at_timestamp()
     # aria_data.get_transform_world_aria()

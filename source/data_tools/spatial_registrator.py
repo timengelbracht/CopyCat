@@ -8,6 +8,7 @@ import time
 import os
 import pickle
 from scipy.spatial.transform import Rotation as R
+import pandas as pd
 
 from hloc import (
     extract_features,
@@ -159,7 +160,7 @@ class SpatialRegistrator:
 
         print(f"[REGISTRATION] Visual registration set up at {self.visual_registration_output_path}")
 
-    def visual_registration(self, from_gt: bool = True):
+    def visual_registration(self, from_gt: bool = True, force: bool = False):
         """
         End-to-end HLoc pipeline:
             1  NetVLAD for map + query
@@ -171,10 +172,13 @@ class SpatialRegistrator:
 
         print(f"[REGISTRATION] Starting visual registration...")
 
-        # delete old files in output directory
-        if Path(self.visual_registration_output_path / "outputs").exists():
+        if force and Path(self.visual_registration_output_path / "outputs").exists():
             shutil.rmtree(self.visual_registration_output_path / "outputs")
-
+            print(f"[REGISTRATION] Force removing previous outputs.")
+        if not force and Path(self.visual_registration_output_path / "outputs").exists():
+            print(f"[REGISTRATION] Outputs already exist. Use force=True to overwrite.")
+            return
+        
         extract_features.main(
             conf=self.feature_conf,
             image_dir=self.images,
@@ -277,11 +281,40 @@ class SpatialRegistrator:
         
         print(f"[REGISTRATION] Visual registration completed. Results saved to {self.results_dir}")
 
-    def pcd_to_pcd_registration(self, vis: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    def pcd_to_pcd_registration(self, vis: bool = False, force: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+
+        """
+        Perform point cloud to point cloud registration based on the visual registration results.
+        Hloc Query poses and therem corresponding odoemtry poses are used to
+        compute the transformation between the map and the query. ICP refinement
+        is performed to align the point clouds.
+        Args:
+            vis (bool): Whether to visualize the registration process.
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: The transformation matrix and the aligned point cloud.
+        """
+
+        if force and Path(self.visual_registration_output_path / "T_wq.json").exists():
+            os.remove(self.visual_registration_output_path / "T_wq.json")
+            print(f"[REGISTRATION] Force removing previous transformation matrix.")
+        if not force and Path(self.visual_registration_output_path / "T_wq.json").exists():
+            print(f"[REGISTRATION] Transformation matrix already exists. Use force=True to overwrite.")
+            return
+
+        print(f"[REGISTRATION] Starting point cloud registration...")
         
         # get the point clouds from the map (leica) and query
         pcd_map_gt = self.loader_map.get_downsampled(scan="post")
-        pcd_query = self.loader_query.get_downsampled()
+
+        if isinstance(self.loader_query, AriaData):
+            pcd_query = self.loader_query.get_semidense_points_pcd()
+        elif isinstance(self.loader_query, IPhoneData):
+            pass
+            pcds_query = []
+            # pcd_query is extracted below per time stamp of the query
+        elif isinstance(self.loader_query, GripperData):
+            # TODO - implement extraction for GripperData
+            pass
 
         # get image timestamp and pose of query in Leica world frame
         pose_query = self.get_poses_query() 
@@ -294,12 +327,8 @@ class SpatialRegistrator:
             T_wc = pose_query[name]["w_T_wc"]
             timestamp = int(name)
 
-            if self.loader_query.sensor_module_name == "aria_human_ego":
-                # get the pose of the Aria sensor module
-                # c- camera
-                # w- world
-                # a- Aria
-                # d- device
+            frames = []
+            if isinstance(self.loader_query, AriaData):
                 T_ad = self.loader_query.get_mps_pose_at_timestamp(timestamp)
                 if T_ad is None:
                     print(f"[!] No pose found for timestamp {timestamp}. Skipping.")
@@ -309,11 +338,28 @@ class SpatialRegistrator:
                 T_ca = np.linalg.inv(T_dc @ T_cRaw_cRect) @ np.linalg.inv(T_ad)
                 T_wa = T_wc @ T_ca
                 T_was.append(T_wa)
-            elif self.loader_query.sensor_module_name == "iphone_left":
-                raise NotImplementedError("iPhone data not implemented yet.")
-            elif self.loader_query.sensor_module_name == "gripper":
+
+                frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+                frame.transform(T_wc)
+                frames.append(frame)
+
+            elif isinstance(self.loader_query, IPhoneData):
+                pcd_query = self.loader_query.get_cloud_at_timestamp(timestamp, voxel=None)
+                pcds_query.append(pcd_query)
+                T_qc = self.loader_query.get_pose_at_timestamp(timestamp)
+                T_arkit_to_o3d = np.diag([1, -1, -1, 1]) 
+                T_wa = T_wc @ np.linalg.inv(T_qc @ T_arkit_to_o3d)
+                T_was.append(T_wa)
+
+                frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+                frame.transform(T_wc)
+                frames.append(frame)
+
+            elif isinstance(self.loader_query, GripperData):
                 raise NotImplementedError("Gripper data not implemented yet.")
 
+        if isinstance(self.loader_query, IPhoneData):
+            pcd_query = pcds_query[0]
 
         # get average transformation and filter outliers
         T_wa = self.mean_transformation(T_was)
@@ -326,29 +372,53 @@ class SpatialRegistrator:
         reg_icp = o3d.pipelines.registration.registration_icp(
             pcd_query_aligned, pcd_map_gt, threshold,
             np.eye(4),
-            o3d.pipelines.registration.TransformationEstimationPointToPlane())
+            o3d.pipelines.registration.TransformationEstimationPointToPoint())
 
         w_pcd_query_aligned_icp = copy.deepcopy(pcd_query_aligned)
         w_pcd_query_aligned_icp.transform(reg_icp.transformation)
-        w_pcd_query_aligned_icp.paint_uniform_color([0, 1, 0]) 
-
-        if vis:
-            pcd_query_aligned.paint_uniform_color([0, 0, 1])
-            pcd_query.paint_uniform_color([1, 0, 0])  # Red
-
-            axis = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=10.0,    # length of axes
-                origin=[0, 0, 0])
-        
-            # Visualize both point clouds
-            o3d.visualization.draw_geometries(
-                [axis, w_pcd_query_aligned_icp, pcd_query],
-                window_name="Before (red) and After (green) Registration",
-                point_show_normal=False
-            )
+        # w_pcd_query_aligned_icp.paint_uniform_color([0, 1, 0]) 
 
         T_wa_final = reg_icp.transformation @ T_wa
         self.T_world_query = T_wa_final
+
+        if vis:
+        
+            # visualize the trajectory of the query module
+            stride = 200
+            trajectory_query = self.get_trajectory_query()
+            trajectory_query = trajectory_query.iloc[::stride, :].reset_index(drop=True)
+            
+            frames_query = []
+            T_dc = self.loader_query.calibration["T_device_camera"]
+            T_cRaw_cRect = self.loader_query.calibration["pinhole_T_device_camera"]
+            for i in range(len(trajectory_query)):
+                qw = trajectory_query["qw"].iloc[i]
+                qx = trajectory_query["qx"].iloc[i]
+                qy = trajectory_query["qy"].iloc[i]
+                qz = trajectory_query["qz"].iloc[i]
+                tx = trajectory_query["tx"].iloc[i]
+                ty = trajectory_query["ty"].iloc[i]
+                tz = trajectory_query["tz"].iloc[i]
+
+                T_ad = np.eye(4)
+                T_ad[:3, :3] = R.from_quat([qx, qy, qz, qw]).as_matrix()
+                T_ad[:3, 3] = np.array([tx, ty, tz])
+
+                # T_ca = np.linalg.inv(T_dc @ T_cRaw_cRect) @ np.linalg.inv(T_ad)
+                # T_wa = T_wc @ T_ca
+
+                frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+                frame.transform(T_ad)
+                frame.transform(T_wa_final)
+                frames_query.append(copy.deepcopy(frame))
+
+            # Visualize both point clouds
+            o3d.visualization.draw_geometries(
+                [pcd_map_gt] + frames + frames_query,
+                point_show_normal=False
+            )
+
+
 
         # save the transformation matrix as a json file
         T_wa_final_dict = {
@@ -362,6 +432,40 @@ class SpatialRegistrator:
 
         return T_wa_final
 
+    def test(self):
+
+        timestamp = 271339268936
+        T_arkit_to_o3d = np.diag([1, -1, -1, 1]) 
+        pose_query = self.get_poses_query() 
+        T_wc = pose_query[str(timestamp)]["w_T_wc"]
+
+        pcd_query = self.loader_query.get_cloud_at_timestamp(timestamp)
+        T_qc = self.loader_query.get_pose_at_timestamp(timestamp)
+        T_wa = T_wc @ np.linalg.inv(T_qc @ T_arkit_to_o3d)
+
+        pcd = copy.deepcopy(pcd_query)
+        pcd_world = pcd.transform(T_wa)
+
+        # Create coordinate frame (frustum-like pose)
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+        frame.transform(T_qc)
+        frame.transform(T_wa)
+
+        frame_hloc = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+        frame_hloc.transform(T_wc)
+        
+
+        pcd_map_gt = self.loader_map.get_downsampled(scan="post")
+
+        # Optionally also render camera position from query (T_wc)
+        # camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+        # camera_frame.transform(T_wc)
+
+        # Visualize
+        o3d.visualization.draw_geometries([pcd_world, pcd_map_gt, frame_hloc],)
+
+        
+        a = 2
 
     def get_sfm_model(self) -> pycolmap.Reconstruction:
         """
@@ -482,6 +586,32 @@ class SpatialRegistrator:
 
         return poses
     
+    def get_trajectory_query(self) -> pd.DataFrame:
+        """
+        Get trajectory full trajectry of the query module (not just the keyframes used for alignemnt)
+        Trajectory is given in query module frame.
+        NOT IN WORLD FRAME!
+        Returns:
+            pd.DataFrame: Trajectory of the query module.
+        """
+
+        if isinstance(self.loader_query, AriaData):
+            trajectory = self.loader_query.get_closed_loop_trajectory()
+            # get timestamp, qw_world, qx_world, qy_world, qz_world, tx_world, ty_world, tz_world
+            trajectory = trajectory[["timestamp", "tx_world_device", "ty_world_device", "tz_world_device", "qw_world_device", "qx_world_device", "qy_world_device", "qz_world_device"]]
+            #rename columns
+            trajectory.columns = ["timestamp", "tx", "ty", "tz", "qw", "qx", "qy", "qz"]
+        elif isinstance(self.loader_query, IPhoneData):
+            trajectory = self.loader_query.get_trajectory()
+            # get timestamp, qw_world, qx_world, qy_world, qz_world, tx_world, ty_world, tz_world
+            # TODO - implement extraction for IPhoneData
+            raise NotImplementedError("IPhoneData trajectory extraction not implemented yet.")
+        elif isinstance(self.loader_query, GripperData):
+            # TODO - implement extraction for GripperData
+            raise NotImplementedError("GripperData trajectory extraction not implemented yet.")
+
+        return trajectory
+    
     def mean_transformation(self, T_list: list) -> np.ndarray:
 
         """
@@ -516,8 +646,8 @@ class SpatialRegistrator:
         median_dist = np.median(avg_dist)
 
         # filter outlier if distance is greater than 1.5 * median distance or less than 0.5 * median distance
-        outlier_mask_rot = np.logical_and(avg_dist < 1.25 * median_dist, avg_dist > 0.75 * median_dist)
-        outlier_mask_trans = np.logical_and(t_norm < 1.25 * t_norm_median, t_norm > 0.75 * t_norm_median)
+        outlier_mask_rot = np.logical_and(avg_dist <= 1.25 * median_dist, avg_dist >= 0.75 * median_dist)
+        outlier_mask_trans = np.logical_and(t_norm <= 1.25 * t_norm_median, t_norm >= 0.75 * t_norm_median)
         outlier_mask = np.logical_and(outlier_mask_rot, outlier_mask_trans)
 
         # compute mean transformation
@@ -577,7 +707,7 @@ class SpatialRegistrator:
         rec.write(self.initial_sfm_dir)
         print(f"[REGISTRATION] Reconstruction created from gt poses. Saved to {self.initial_sfm_dir}")
 
-    def visual_registration_viz(self):
+    def visual_registration_viz(self, show_trajectory: bool = True):
         """
         Visualise the map (points + map cameras) together with all
         localised query cameras inside an interactive Plotly view.
@@ -597,7 +727,6 @@ class SpatialRegistrator:
 
         K_pinhole = self.loader_query.calibration["K"]
 
-        
         query_poses = self.get_poses_query()
         for name, pose in query_poses.items():
             w_T_wc = pose["w_T_wc"]
@@ -667,19 +796,19 @@ class SpatialRegistrator:
 
 if __name__ == "__main__":
     # Example usage
-    base_path = Path(f"/bags/spot-aria-recordings/dlab_recordings")
+    base_path = Path(f"/data/dlab_recordings")
     leica_data = LeicaData(base_path)
 
-    rec_name = "door_6"
-    sensor_module_name = "aria_human_ego"
+    rec_name = "door_8"
+    sensor_module_name = "aria_gripper_ego"
     aria_data = AriaData(base_path=base_path, rec_name=rec_name, sensor_module_name=sensor_module_name)
 
     # sensor_module_name = "iphone_left"
     # iphone_data = IPhoneData(base_path=base_path, rec_name=rec_name, sensor_module_name=sensor_module_name)
 
     spatial_registrator = SpatialRegistrator(loader_map=leica_data, loader_query=aria_data)
-    spatial_registrator.visual_registration(from_gt=True)
-    spatial_registrator.pcd_to_pcd_registration()
+    # spatial_registrator.visual_registration(from_gt=True)
+    spatial_registrator.pcd_to_pcd_registration(vis=True, force=True)
 
     # spatial_registrator.visual_registration_viz()
     # spatial_registrator.viz_2d()

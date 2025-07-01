@@ -1,0 +1,38 @@
+{
+  "name": "aria_dev",
+  "dockerFile": "../Dockerfile",
+  "context": "..",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash"
+      },
+      "extensions": [
+        "ms-vscode-remote.remote-containers",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  },
+  "mounts": [
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=/dev,target=/dev,type=bind",
+    "source=/home/cvg/Documents,target=/exchange,type=bind",
+    "source=/dev/bus/usb,target=/dev/bus/usb,type=bind",
+    "source=/run/udev,target=/run/udev,type=bind,readonly",
+    "source=/media/cvg/Extreme Pro,target=/data,type=bind"
+  ],
+  "runArgs": [
+    "--privileged",
+    "--gpus=all",                  
+    "--group-add=plugdev",
+    "--group-add=video",
+    "--env=DISPLAY",               
+    "--env=QT_X11_NO_MITSHM=1",     
+    "--env=NVIDIA_DRIVER_CAPABILITIES=all",
+    "--env=NVIDIA_VISIBLE_DEVICES=all"
+  ],
+  "remoteUser": "root",
+  "workspaceFolder": "/exchange"
+}
