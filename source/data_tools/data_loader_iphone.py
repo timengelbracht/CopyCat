@@ -10,7 +10,7 @@ import zipfile
 import open3d as o3d
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
-from data_preproc import DataPrechecker
+from data_indexer import RecordingIndex
 import liblzfse
 import subprocess
 
@@ -20,15 +20,15 @@ class IPhoneData:
                  rec_type: str,
                  rec_module: str,
                  interaction_indices: str,
-                 data_prechecker: Optional[DataPrechecker] = None,):
+                 data_indexer: Optional[RecordingIndex] = None):
 
         self.rec_loc = rec_loc
         self.base_path = base_path
         self.rec_type = rec_type
         self.rec_module = rec_module
         self.interaction_indices = interaction_indices
-        if data_prechecker is not None:
-            self.data_prechecker = data_prechecker
+        if data_indexer is not None:
+            self.data_indexer = data_indexer
 
 
         root_raw = Path(self.base_path) / "raw" / self.rec_loc / self.rec_type
@@ -71,6 +71,7 @@ class IPhoneData:
 
         self.extracted_rgbd = Path(self.extraction_path / self.label_rgb.strip("/")).exists()
         
+        self.rgb_extension = ".jpg"
 
     def load_metadata(self):
         if not self.meta_data.exists():
@@ -154,6 +155,18 @@ class IPhoneData:
             cv2.imwrite(str(out_file_rgb), rgb_img)
             # cv2.imwrte(str(out_file_depth), depth_img)
             np.save(str(out_file_depth), depth_img)
+
+        # Remove unnecessary files and directories
+        # Remove unnecessary files and directories
+        for file in [*rgbd_dir.iterdir(), 
+                 self.extraction_path / "icon"
+                 "", self.extraction_path / "sound.m4a"]:
+            if file.exists():
+                file.unlink() if file.is_file() else file.rmdir()
+
+        # Remove the rgbd directory itself
+        # if rgbd_dir.exists():
+        #     rgbd_dir.rmdir()
 
         self.extracted_rgbd = True
 
@@ -441,29 +454,32 @@ class IPhoneData:
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-
-
-    # Example usage
     rec_location = "bedroom_1"
     base_path = Path(f"/data/ikea_recordings")
-    rec_type = "gripper"
-    rec_module = "iphone_1"
-    interaction_indices = "1-8"
+
     
-    data_prechecker = DataPrechecker(
+    data_indexer = RecordingIndex(
         os.path.join(str(base_path), "raw") 
     )
 
-    iphone_data = IPhoneData(base_path, 
-                             rec_location,  
-                             rec_type, 
-                             rec_module, 
-                             interaction_indices,
-                             data_prechecker=data_prechecker)
+    iphone_queries_at_loc = data_indexer.query(
+        location=rec_location, 
+        interaction=None, 
+        recorder="iphone*"
+    )
+
     
-    iphone_data.extract_rgbd()
-    iphone_data.extract_poses()
+    for loc, inter, rec, ii, path in iphone_queries_at_loc:
+        print(f"Found recorder: {rec} at {path}")
+
+        rec_type = inter
+        rec_module = rec
+        interaction_indices = ii
+
+        iphone_data = IPhoneData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+
+        iphone_data.extract_rgbd()
+        iphone_data.extract_poses()
 
     # iphone_data.extract_plys()
     # iphone_data.extract_rgbd()

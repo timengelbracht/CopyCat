@@ -16,7 +16,7 @@ from scipy.spatial.transform import Slerp
 import json
 from utils import ensure_dir, save_image, clean_label, estimate_fps, load_sorted_images, is_valid_image
 from mps_request import MPSClient
-from data_preproc import RecordingIndex
+from data_indexer import RecordingIndex
 
 class AriaData:
 
@@ -70,6 +70,8 @@ class AriaData:
         self.data_indexer = data_indexer
 
         self.logging_tag = f"{self.rec_loc}_{self.rec_type}_{self.rec_module}".upper()
+
+        self.rgb_extension = ".png"  # Assuming RGB images are in PNG format
 
     def load_provider(self):
         if not self.vrs_file_raw.exists():
@@ -165,14 +167,14 @@ class AriaData:
 
         mps_client = MPSClient()
 
-        if self.mps_path_raw_all_devices.exists() and not force:
-            print(f"[{self.logging_tag}] MPS data for all devices already exists at {self.mps_path_raw_all_devices}")
-            return
-
         all_vrs_files = self.data_indexer.vrs_files(
             location=self.rec_loc
         )
 
+        if self.mps_path_raw_all_devices.exists() and len(list(self.mps_path_raw_all_devices.iterdir())) >= len(all_vrs_files) and not force:
+            print(f"[{self.logging_tag}] MPS data for all devices already exists at {self.mps_path_raw_all_devices}")
+            return
+        
         # try:
         mps_client.request_multi(
             input_paths=all_vrs_files,
@@ -233,7 +235,7 @@ class AriaData:
 
         print(f"[{self.logging_tag}] Saved RGB images to {out_dir}")
 
-    def extract_mps(self):
+    def extract_mps(self, mps_path: Optional[str | Path | os.PathLike] = None) -> None:
 
         if self.extracted_mps:
             print(f"[{self.logging_tag}] MPS data already extracted to {self.extraction_path}")
@@ -281,6 +283,72 @@ class AriaData:
         # Update extracted flag
         self.extracted_mps = True
         print(f"[{self.logging_tag}] Extracted MPS data to {csv_dir}")
+
+    def extract_mps_multi(self, force: bool = False) -> None:
+        """
+        Extracts multi MPS data for this device.
+        """
+
+        all_vrs_files = self.data_indexer.vrs_files(
+            location=self.rec_loc
+        )
+
+        if not self.mps_path_raw_all_devices.exists() or len(list(self.mps_path_raw_all_devices.iterdir())) < len(all_vrs_files) :
+            raise FileNotFoundError(f"MPS data for all devices not found at {self.mps_path_raw_all_devices}, please run request_mps_all_devices() first.")
+
+        multi_slam_config_file = self.mps_path_raw_all_devices / "vrs_to_multi_slam.json"
+
+        if not multi_slam_config_file.exists():
+            raise FileNotFoundError(f"Multi SLAM config file not found: {multi_slam_config_file}. Please run request_mps_all_devices() first.")
+        
+        with open(multi_slam_config_file, "r") as f:
+            multi_slam_config = json.load(f)
+
+        multi_slam_index = multi_slam_config.get(str(self.vrs_file_raw))
+
+        # Path to closed loop SLAM trajectory
+        closed_loop_trajectory_file = self.mps_path_raw_all_devices / multi_slam_index / "slam" / "closed_loop_trajectory.csv"  # fixed typo in filename
+        semidense_points_file = self.mps_path_raw_all_devices / multi_slam_index / "slam" / "semidense_points.csv.gz"
+
+        try:
+            df = pd.read_csv(closed_loop_trajectory_file)
+        except Exception as e:
+            print(f"[{self.logging_tag}] Failed to read CSV {closed_loop_trajectory_file}: {e}")
+            return
+        
+        try:
+            df_pts = pd.read_csv(semidense_points_file, compression='gzip')
+        except Exception as e:
+            print(f"[{self.logging_tag}] Failed to read CSV {semidense_points_file}: {e}")
+            return
+
+        # Normalize to 'timestamp' naming
+        if "tracking_timestamp_us" in df.columns:
+            df["tracking_timestamp_us"] = (df["tracking_timestamp_us"].astype(np.int64) * 1_000)
+            df.rename(columns={"tracking_timestamp_us": "timestamp"}, inplace=True)
+
+        # Save to extracted location
+        label_clt = f"multi_slam/closed_loop_trajectory"
+        csv_dir = self.extraction_path / label_clt.strip("/")
+        ensure_dir(csv_dir)
+        df.to_csv(csv_dir / "data.csv", index=False)
+
+        print(f"[{self.logging_tag}] Saved closed loop trajectory CSV: {csv_dir}/data.csv")
+
+        label_sdp = f"multi_slam/semidense_points"
+        csv_dir = self.extraction_path / label_sdp.strip("/")
+        ensure_dir(csv_dir)
+        df_pts.to_csv(csv_dir / "data.csv", index=False)
+
+        print(f"[{self.logging_tag}] Saved semidense points CSV: {csv_dir}/data.csv")
+
+        # TODO - add more mps data extraction as needed
+        # TODO - UTC timestamp is NOT changed at the moment, only device timestamp!!!!
+        
+        print(f"[{self.logging_tag}] Extracted multi MPS data to {csv_dir}")
+
+
+        a = 2
 
     def extract_video(self, out_dir: Optional[str | Path] = None, undistort: bool = True) -> None:
         """
@@ -574,6 +642,7 @@ if __name__ == "__main__":
         recorder="aria*"
     )
 
+    # Uncomment the following lines to process each aria query
     for loc, inter, rec, ii, path in aria_queries_at_loc:
         print(f"Found recorder: {rec} at {path}")
 
@@ -583,17 +652,24 @@ if __name__ == "__main__":
 
         aria_data = AriaData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
 
-        aria_data.request_mps(force=False)
-        # aria_data.extract_vrs(undistort=False)
-        aria_data.extract_vrs(undistort=True)
-
-        aria_data.extract_mps()
-
-    # aria_data.request_mps_all_devices(force=True)
+        aria_data.extract_mps_multi()
 
 
+    # Uncomment the following lines to process each aria query
+    # for loc, inter, rec, ii, path in aria_queries_at_loc:
+    #     print(f"Found recorder: {rec} at {path}")
 
-    # aria_data.extract_keyframes()
-    # aria_data.extract_keyframes(undistort=True, only_first_frame=False)
-    # aria_data.get_mps_pose_at_timestamp()
-    # aria_data.get_transform_world_aria()
+    #     rec_type = inter
+    #     rec_module = rec
+    #     interaction_indices = ii
+
+    #     aria_data = AriaData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+
+    #     aria_data.request_mps(force=False)
+    #     # aria_data.extract_vrs(undistort=False)
+    #     aria_data.extract_vrs(undistort=True)
+
+    #     aria_data.extract_mps()
+
+    
+

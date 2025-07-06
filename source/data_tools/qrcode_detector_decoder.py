@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 from time_aligner import TimeAligner
 from typing import List, Tuple
+from tqdm import tqdm
 
 class QRCodeDetectorDecoder:
     def __init__(self, frame_dir: Path, ext=".jpg"):
@@ -50,15 +51,18 @@ class QRCodeDetectorDecoder:
 
         return timestamp_ns
 
-    def find_first_valid_qr(self):
+    def find_first_valid_qr(self, stride: int = 1) -> Tuple[int, int]:
         frame_files = sorted(self.frame_dir.glob(f"*{self.ext}"), key=lambda p: int(p.stem))
-        for frame_path in frame_files:
+        for frame_path in tqdm(frame_files[::stride], desc=f"Searching for valid QR codes in {self.frame_dir.name}"):
             img = cv2.imread(str(frame_path))
             if img is None:
                 continue
 
             # val, points, _ = self.qr.detectAndDecode(img)
-            retval_detect, points = self.qr.detect(img)
+            try:
+                retval_detect, points = self.qr.detect(img)
+            except: 
+                continue
             if retval_detect and points is not None and cv2.contourArea(points) > 0:
                 retval_decode, _ = self.qr.decode(img, points)
                 if retval_decode != "":
@@ -72,7 +76,8 @@ class QRCodeDetectorDecoder:
                     #               (device_time, utc_time)
                     return (int(frame_path.stem), timestamp_ns)
 
-        raise RuntimeError("No valid QR code found in the stream.")
+        print(f"[{self.logging_tag}] No valid QR code found in the directory.")
+        return (None, None)
     
     def find_all_valid_interaction_qrs(self, qr_decoded_text: str, min_rel_area: float = 0.15) -> List[tuple[int, int]]:
         """
