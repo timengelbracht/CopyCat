@@ -9,7 +9,16 @@ import os
 import pickle
 from scipy.spatial.transform import Rotation as R
 import pandas as pd
-
+import plotly.graph_objects as go
+import shutil
+from PIL import Image
+import json
+from scipy.spatial.transform import Rotation
+from data_loader_aria import AriaData
+from data_loader_leica import LeicaData
+from data_loader_iphone import IPhoneData
+from data_loader_gripper import GripperData
+from data_indexer import RecordingIndex
 from hloc import (
     extract_features,
     match_features,
@@ -18,14 +27,15 @@ from hloc import (
     pairs_from_retrieval,
     triangulation
 )
-
 from hloc.localize_sfm import main as localize_sfm_main
+from hloc import localize_inloc
 from hloc.visualization import plot_images, read_image
 from hloc.utils import viz_3d
-
 import pycolmap
-from hloc.localize_sfm import QueryLocalizer, pose_from_cluster
+import cv2
+from contextlib import contextmanager
 
+# Mokey patches for pycolmap compatibility and missing features
 if not hasattr(pycolmap, "absolute_pose_estimation"):
     def absolute_pose_estimation(points2D, points3D, camera,
                                  estimation_options=None,
@@ -57,15 +67,94 @@ if not hasattr(pycolmap.Rigid3d, "essential_matrix"):
 
     pycolmap.Rigid3d.essential_matrix = essential_matrix
 
-import shutil
-from PIL import Image
-import json
-from scipy.spatial.transform import Rotation
+# Monkey patch for hloc localize_inloc to accept additional focal length parameter
+def set_intrinsics(*, fx: float, fy: float):
+    global FX, FY
+    FX, FY = float(fx), float(fy)
 
-from data_loader_aria import AriaData
-from data_loader_leica import LeicaData
-from data_loader_iphone import IPhoneData
-from data_loader_gripper import GripperData
+def pose_from_cluster_patched(
+        dataset_dir, q, retrieved,
+        feature_file, match_file,
+        skip=None
+    ):
+    """Drop‑in replacement for hloc.localize_inloc.pose_from_cluster
+    that takes focal_length as an optional argument."""
+
+    height, width = cv2.imread(str(dataset_dir / q)).shape[:2]
+    cx = 0.5 * width
+    cy = 0.5 * height
+    fx = FX
+    fy = FY
+
+    all_mkpq, all_mkpr, all_mkp3d, all_indices = [], [], [], []
+    kpq = feature_file[q]["keypoints"].__array__()
+    num_matches = 0
+
+    for i, r in enumerate(retrieved):
+        kpr = feature_file[r]["keypoints"].__array__()
+        pair = localize_inloc.names_to_pair(q, r)
+        m = match_file[pair]["matches0"].__array__()
+        v = m > -1
+
+        if skip and (np.count_nonzero(v) < skip):
+            continue
+
+        mkpq, mkpr = kpq[v], kpr[m[v]]
+        num_matches += len(mkpq)
+
+        scan_r = localize_inloc.loadmat(Path(dataset_dir, r + ".mat"))["XYZcut"]
+        mkp3d, valid = localize_inloc.interpolate_scan(scan_r, mkpr)
+        Tr = localize_inloc.get_scan_pose(dataset_dir, r)
+        mkp3d = (Tr[:3, :3] @ mkp3d.T + Tr[:3, -1:]).T
+
+        all_mkpq.append(mkpq[valid])
+        all_mkpr.append(mkpr[valid])
+        all_mkp3d.append(mkp3d[valid])
+        all_indices.append(np.full(np.count_nonzero(valid), i))
+
+    all_mkpq  = np.concatenate(all_mkpq,  0)
+    all_mkpr  = np.concatenate(all_mkpr,  0)
+    all_mkp3d = np.concatenate(all_mkp3d, 0)
+    all_indices = np.concatenate(all_indices, 0)
+
+    cfg = {
+        "model":  "PINHOLE",
+        "width":   width,
+        "height":  height,
+        "params": [fx, fy, cx, cy],
+    }
+
+    opts = pycolmap.AbsolutePoseEstimationOptions()
+    opts.ransac.max_error = 48
+    ret = pycolmap.estimate_and_refine_absolute_pose(
+        all_mkpq, all_mkp3d, cfg, opts
+    )
+    ret["cfg"] = cfg
+    return ret, all_mkpq, all_mkpr, all_mkp3d, all_indices, num_matches
+# Patch the original function
+localize_inloc.pose_from_cluster = pose_from_cluster_patched
+
+@contextmanager
+def pass_focal_length(focal_length: float):                  # focal is a scalar, px
+    """
+    Temporarily monkey‑patch localize_inloc.pose_from_cluster so it uses
+    the given focal length. 
+    """
+    original = localize_inloc.pose_from_cluster      # keep reference
+
+    def patched(dataset_dir, q, retrieved,
+                feature_file, match_file,
+                skip=None, *, focal_length=focal):
+        # call the original but override the kwarg
+        return original(dataset_dir, q, retrieved,
+                        feature_file, match_file,
+                        skip=skip, focal_length=focal_length)
+
+    localize_inloc.pose_from_cluster = patched       # <‑‑ patch
+    try:
+        yield
+    finally:                                         # <‑‑ restore
+        localize_inloc.pose_from_cluster = original
 
 class SpatialRegistrator:
     """
@@ -83,17 +172,17 @@ class SpatialRegistrator:
         self.loader_map = loader_map
         self.loader_query = loader_query
 
-        self.image_path_map = Path(self.loader_map.renderings_post_path / "rgb")
-        self.pose_path_map = Path(self.loader_map.renderings_post_path / "poses")
+        self.image_path_map = self.loader_map.extraction_path / self.loader_map.initial_setup / "pano_tiles" / "rgb"
+        self.pose_path_map = self.loader_map.extraction_path / self.loader_map.initial_setup / "pano_tiles" / "poses"
+        self.depth_path_map = self.loader_map.extraction_path / self.loader_map.initial_setup / "pano_tiles" / "depth"
+        self.xyz_path_map = self.loader_map.extraction_path / self.loader_map.initial_setup / "pano_tiles" / "xyz"
         # TODO pre/post selection
 
         if isinstance(self.loader_query, AriaData):
-            self.image_path_query = Path(self.loader_query.visual_registration_output_path / self.loader_query.label_keyframes.strip("/"))
+            self.image_path_query = Path(self.loader_query.extraction_path/ self.loader_query.label_keyframes.strip("/"))
             # TODO raw/undistorted selection
         elif isinstance(self.loader_query, IPhoneData):
             self.image_path_query = Path(self.loader_query.visual_registration_output_path / self.loader_query.label_keyframes.strip("/"))
-        elif isinstance(self.loader_query, GripperData):
-            # TODO - implement extraction for GripperData
             pass
 
         # HLoc configuration
@@ -113,12 +202,16 @@ class SpatialRegistrator:
         self.features = self.visual_registration_output_path / "outputs" / f"{self.feature_conf['output']}.h5"
         self.features_retrieval = self.visual_registration_output_path / "outputs" / f"{self.retrieval_conf['output']}.h5"
 
-        self._set_up_visual_registration()
 
-        self.images = self.visual_registration_output_path / "images"
-        self.references = [p.relative_to(self.images).as_posix() for p in (self.images / "mapping/").iterdir()]
-        self.query = [p.relative_to(self.images).as_posix() for p in (self.images / "query/").iterdir()]
+        self.images = self.visual_registration_output_path / "inloc" 
+        self._set_up_visual_registration_inloc()
 
+        # self.images = self.visual_registration_output_path / "images"
+        # self.references = [p.relative_to(self.images).as_posix() for p in (self.images / "mapping/").iterdir()]
+        
+        self.references = [p.relative_to(self.images).as_posix() for p in (self.images / "database" / "cutouts").glob("*.jpg")]
+        # self.query = [p.relative_to(self.images).as_posix() for p in (self.images / "query/").iterdir()]
+        self.query = [p.relative_to(self.images).as_posix() for p in (self.images / "query" / "iphone7").glob("*.png")]
         self.T_world_query = None
 
     def _set_up_visual_registration(self):
@@ -137,7 +230,6 @@ class SpatialRegistrator:
 
         image_dir_query = image_dir / "query"
         image_dir_query.mkdir(parents=True, exist_ok=True)
-
 
         # Copy images to the mapping and query directories
         for image in tqdm(self.image_path_map.glob("*"), desc="Copying images to mapping", total=len(list(self.image_path_map.glob("*")))):
@@ -160,11 +252,141 @@ class SpatialRegistrator:
 
         print(f"[REGISTRATION] Visual registration set up at {self.visual_registration_output_path}")
 
+    def _set_up_visual_registration_inloc(self):
+        """
+        Set up the visual registration HLoc directory structure and copy images for InLoc.
+        """
+
+        out_dir = self.visual_registration_output_path / "outputs"
+        image_dir = self.visual_registration_output_path / "inloc" 
+        image_dir_mapping = image_dir / "database" / "cutouts"
+        image_dir_query = image_dir / "query" / "iphone7"
+        transform_dir = image_dir / "database" / "alignments" / "database" / "transformations"
+
+        if self.images.exists():
+            print(f"[REGISTRATION] Outputs directory already exists: {out_dir}. Use force=True to overwrite.")
+            return
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_dir_mapping.mkdir(parents=True, exist_ok=True)
+        image_dir_query.mkdir(parents=True, exist_ok=True)
+        transform_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy images to the mapping and query directories
+        for image in tqdm(self.image_path_map.glob("*"), desc="Copying images to mapping", total=len(list(self.image_path_map.glob("*")))):
+            if image.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                dest_path = image_dir_mapping / f"000_database_cutouts_{image.stem}.jpg"
+            try:
+                img = Image.open(image)
+                img.convert("RGB").save(dest_path, "JPEG")
+            except Exception as e:
+                print(f"Failed to convert {image}: {e}")
+
+        # copy xyz to mapping directory
+        for xyz in tqdm(self.xyz_path_map.glob("*"), desc="Copying xyz to mapping", total=len(list(self.xyz_path_map.glob("*")))):
+            if xyz.suffix.lower() in [".mat"]:
+                dest_path = image_dir_mapping / f"000_database_cutouts_{xyz.stem}.mat"
+                dest_path_transform = transform_dir / f"000_trans_cutouts.txt"
+                try:
+                    shutil.copy(xyz, dest_path)
+                    self._generate_dummy_transformations_files(dest_path_transform)
+                except Exception as e:
+                    print(f"Failed to copy {xyz}: {e}")
+
+
+        for image in tqdm(self.image_path_query.glob("*.png"), desc="Copying images to query", total=len(list(self.image_path_query.glob("*.png")))):
+            if image.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                dest_path = image_dir_query / f"000_database_cutouts_{image.stem}.png"
+                try:
+                    img = Image.open(image)
+                    img.convert("RGB").save(dest_path, "PNG")
+                except Exception as e:
+                    print(f"Failed to convert {image}: {e}")
+
+        print(f"[REGISTRATION] Visual registration set up at {self.visual_registration_output_path}")
+
+    def visual_registration_inloc(self, force: bool = False):
+        """
+        End-to-end HLoc pipeline for InLoc:
+            1  Extract features for mapping and query images
+            2  Match features using SuperGlue
+            3  Localize query images in the mapping using InLoc
+        """
+
+        if force and any(Path(self.visual_registration_output_path / "outputs").iterdir()):
+            shutil.rmtree(self.visual_registration_output_path / "outputs")
+            print(f"[REGISTRATION] Force removing previous outputs.")
+        if not force and any(Path(self.visual_registration_output_path / "outputs").iterdir()):
+            print(f"[REGISTRATION] Outputs already exist. Use force=True to overwrite.")
+            return
+
+        print("[REG] Starting visual registration…")
+
+        extract_features.main(
+            conf=self.feature_conf,
+            image_dir=self.images,
+            image_list=self.references,
+            feature_path=self.features,
+            overwrite=True)
+        
+        extract_features.main(
+            conf=self.feature_conf, 
+            image_dir=self.images,
+            image_list=self.query,
+            feature_path=self.features,
+            overwrite=False)
+
+        extract_features.main(                       
+            conf=self.retrieval_conf, 
+            image_dir=self.images,
+            image_list=self.references,
+            feature_path=self.features_retrieval, 
+            overwrite=True)
+
+        extract_features.main(                       
+            conf=self.retrieval_conf, 
+            image_dir = self.images,
+            image_list=self.query,
+            feature_path=self.features_retrieval, 
+            overwrite=False)
+        
+        pairs_from_retrieval.main(
+            descriptors = self.features_retrieval,
+            output      = self.loc_pairs,
+            num_matched = 20,
+            query_list  = self.query,        
+            db_list     = self.references,  
+        )
+
+        match_features.main(
+            conf      = self.matcher_conf,
+            pairs     = self.loc_pairs,
+            features  = self.features,
+            matches   = self.matches,        
+            overwrite = True
+        )
+
+        # use monkey patch to inject focal length into localize_inloc
+        fx = self.loader_query.calibration["K"][0, 0]
+        fy = self.loader_query.calibration["K"][1, 1]
+        set_intrinsics(fx=fx, fy=fy)
+
+        localize_inloc.main(
+            dataset_dir=self.images,
+            retrieval=self.loc_pairs,
+            features=self.features,
+            matches=self.matches,
+            results=self.results_dir,
+            skip_matches=5)
+
+        print(f"[REGISTRATION] Visual registration completed. Results saved to {self.results_dir}")
+
     def visual_registration(self, from_gt: bool = True, force: bool = False):
         """
         End-to-end HLoc pipeline:
             1  NetVLAD for map + query
-            2  SuperPoint + SuperGlue on map → SfM model
+            2  SuperPoint + SuperGlue on map -> SfM model
             3  NetVLAD query→map pairs  (single call)
             4  SuperGlue matching on those pairs
             5  localize_sfm with intrinsics
@@ -794,24 +1016,116 @@ class SpatialRegistrator:
 
         # visualize_loc(results=self.results_dir,image_dir=self.images,reconstruction=self.sfm_dir,db_image_dir=None)
 
+
+    def visual_registration_viz_ply(self,
+                                show_trajectory: bool = False):
+        """
+        Display a PLY point cloud + mapping/query cameras in an interactive
+        Plotly 3‑D viewer.
+
+        Args
+        ----
+        ply_path : Path or str
+            Full path to the point‑cloud *.ply* you exported from Leica / COLMAP.
+        show_trajectory : bool
+            If True, draw a line through the localised query cameras.
+        """
+
+        # ---------- 1. load the point cloud ---------------------------------
+        pcd = self.loader_map.get_downsampled_points()
+        xyz = np.asarray(pcd.points)
+        if pcd.has_colors():
+            rgb = np.asarray(pcd.colors)
+        else:                                # default light‑grey
+            rgb = np.full_like(xyz, 0.7)
+
+        # ---------- 2. init Plotly figure -----------------------------------
+        fig = viz_3d.init_figure()
+
+        # Scatter‑3D for the raw points
+        fig.add_trace(go.Scatter3d(
+            x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+            mode="markers",
+            marker=dict(size=1.5,
+                        color=(rgb * 255).astype(np.uint8),
+                        opacity=0.7),
+            name="map points"
+        ))
+
+        # ---------- 3. plot mapping cameras ---------------------------------
+        K_pinhole = self.loader_query.calibration["K"]
+
+        for name, pose in self.get_poses_query().items():
+            w_T_wc = pose["w_T_wc"]
+            R_wc   = w_T_wc[:3, :3]
+            C_wc   = w_T_wc[:3, 3]
+
+            if np.linalg.norm(C_wc) > 20:
+                print(f"[!] Camera {name} is too far from the origin, skipping.")
+                continue
+
+            viz_3d.plot_camera(fig,
+                R_wc, C_wc,
+                K=K_pinhole,
+                name=name,
+                text=name,
+                color="rgba(0,255,0,0.6)")
+
+        # ---------- 5. layout + show ----------------------------------------
+        fig.update_layout(scene_aspectmode="data",
+                        height=800,
+                        title=f"PLY map + localised queries)")
+        fig.show()
+
+    def _generate_dummy_transformations_files(self, out_path: str) -> None:
+        
+        transform = np.eye(4, dtype=np.float32)  # 4x4 identity matrix
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            for _ in range(7):
+                f.write("dummy\n")
+            for row in transform:
+                f.write(" ".join(f"{x:.6f}" for x in row) + "\n")
+
+    def vis_2d_inloc(self):
+        visualization.visualize_loc(results=self.results_dir, image_dir=self.images, n=10, top_k_db=1, seed=2)
+        import matplotlib.pyplot as plt
+        plt.show()
+
+
 if __name__ == "__main__":
     # Example usage
-    base_path = Path(f"/data/dlab_recordings")
-    leica_data = LeicaData(base_path)
 
-    rec_name = "door_8"
-    sensor_module_name = "aria_gripper_ego"
-    aria_data = AriaData(base_path=base_path, rec_name=rec_name, sensor_module_name=sensor_module_name)
+    # Example usage
+    base_path = Path(f"/data/ikea_recordings")
+    rec_location = "bedroom_1"
 
-    # sensor_module_name = "iphone_left"
-    # iphone_data = IPhoneData(base_path=base_path, rec_name=rec_name, sensor_module_name=sensor_module_name)
+    leica_data = LeicaData(base_path,rec_loc=rec_location, initial_setup="001")
+
+    data_indexer = RecordingIndex(
+        os.path.join(str(base_path), "raw") 
+    )
+
+    aria_queries_at_loc = data_indexer.query(
+        location=rec_location, 
+        interaction="gripper", 
+        recorder="aria_human"
+    )
+
+    for loc, inter, rec, ii, path in aria_queries_at_loc:
+        print(f"Found recorder: {rec} at {path}")
+
+        rec_type = inter
+        rec_module = rec
+        interaction_indices = ii
+
+        aria_data = AriaData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+
 
     spatial_registrator = SpatialRegistrator(loader_map=leica_data, loader_query=aria_data)
-    # spatial_registrator.visual_registration(from_gt=True)
-    spatial_registrator.pcd_to_pcd_registration(vis=True, force=True)
+    spatial_registrator.visual_registration_inloc()
+    # spatial_registrator.vis_2d_inloc()
+    # spatial_registrator.visual_registration_viz_ply()
 
-    # spatial_registrator.visual_registration_viz()
-    # spatial_registrator.viz_2d()
-    # spatial_registrator.get_poses_query()
 
 
