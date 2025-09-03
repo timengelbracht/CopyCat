@@ -32,6 +32,7 @@ def is_valid_image(img_path: Path) -> bool:
         return cv2.imread(str(img_path)) is not None
     except Exception:
         return False
+    
 
 # csv utils
 def load_csv(csv_path: str | Path) -> pd.DataFrame:

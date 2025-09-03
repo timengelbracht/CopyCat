@@ -16,7 +16,7 @@ class KeyframeExtractor:
 
     # Constants for keyframe extraction
     FEATURE_PERCENTILE = 10.0
-    DEPTH_PERCENTILE = 75.0
+    DEPTH_PERCENTILE = 50.0
     BLUR_PERCENTILE = 10.0
 
     # monodepth model setup
@@ -235,4 +235,18 @@ class KeyframeExtractor:
         
         self.selected_keyframes = [candidates[i] for i in selected]
 
+        return self.selected_keyframes
+    
+    def extract_keyframes_evenly_spaced(self):
+        
+        even_stride = len(self.rgb_files) // self.n_keyframes
+        self.selected_keyframes = []
+
+        for i in range(0, len(self.rgb_files), even_stride):
+            self.selected_keyframes.append(self.rgb_files[i])
+
+        # if the last keyframe is not the last image, add it
+        if self.selected_keyframes[-1] != self.rgb_files[-1]:
+            self.selected_keyframes.append(self.rgb_files[-1])
+            
         return self.selected_keyframes
