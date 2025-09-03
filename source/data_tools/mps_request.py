@@ -32,6 +32,10 @@ from typing import List, Sequence
 
 
 class MPSClient:
+
+    ARIA_USERNAME = "zurich_y6vx1s"
+    ARIA_PASSWORD = "zurich0001"
+
     """Thin wrapper around the `aria_mps` command-line tool."""
 
     def __init__(self, cli_bin: str | Path | None = None):
@@ -47,11 +51,18 @@ class MPSClient:
         print("[MPS]", " ".join(shlex.quote(a) for a in cmd))  # simple trace
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+        log_file = "/exchange/mps_cli.log"
         output = []
         try:
             for line in proc.stdout:
                 print(line, end="")        # stream live output
                 output.append(line)
+            # with open(log_file, "w", encoding="utf-8") as f:
+            #     for line in proc.stdout:
+            #         print(line, end="")   # stream live output
+            #         f.write(line)         # write to file
+            #         f.flush()             # ensure it’s written immediately
+            #         output.append(line)
         finally:
             proc.wait()
 
@@ -86,9 +97,9 @@ class MPSClient:
     # --- single-mode -----------------------------------------------------------
     def request_single(
         self,
-        input_path: str | os.PathLike,
+        input_path: str | os.PathLike | Sequence[str | os.PathLike],
         *,
-        features: str | Sequence[str] | None = None,   # ⇐ accept list/tuple/set too
+        features: str | Sequence[str] | None = None,  
         force: bool = False,
         retry_failed: bool = False,
         no_ui: bool = False,
@@ -101,11 +112,30 @@ class MPSClient:
         mps.request_single(file, features="SLAM")                  # one feature
         mps.request_single(file, features=["SLAM", "EYE_GAZE"])    # many
         """
-        path = Path(input_path).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(path)
+        # path = Path(input_path).expanduser().resolve()
+        # if not path.exists():
+        #     raise FileNotFoundError(path)
 
-        args = ["single", "--input", str(path)]
+        # args = ["single", "--input", str(path), "-u", username, "-p", password]
+        # Normalize input_path into a list
+        if isinstance(input_path, (str, os.PathLike)):
+            input_paths = [input_path]
+        else:
+            input_paths = list(input_path)
+
+        # Validate
+        resolved_paths = []
+        for p in input_paths:
+            p = Path(p).expanduser().resolve()
+            if not p.exists():
+                raise FileNotFoundError(p)
+            resolved_paths.append(str(p))
+
+        args = ["single"]
+        for p in resolved_paths:
+            args += ["--input", p]
+
+        args += ["-u", self.ARIA_USERNAME, "-p", self.ARIA_PASSWORD]
 
         # convert iterable → comma-separated string
         if features:
@@ -155,6 +185,8 @@ class MPSClient:
             args.append("--retry-failed")
         if no_ui:
             args.append("--no-ui")
+
+        args += ["-u", self.ARIA_USERNAME, "-p", self.ARIA_PASSWORD]
 
         return self._run(args)
     
