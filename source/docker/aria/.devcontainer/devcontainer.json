@@ -18,10 +18,11 @@
   "mounts": [
     "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
     "source=/dev,target=/dev,type=bind",
-    "source=/home/cvg/Documents,target=/exchange,type=bind",
+    "source=/home/cvg-robotics/tim_ws,target=/exchange,type=bind",
     "source=/dev/bus/usb,target=/dev/bus/usb,type=bind",
     "source=/run/udev,target=/run/udev,type=bind,readonly",
-    "source=/media/cvg/Extreme Pro,target=/data,type=bind"
+    "source=/media/cvg-robotics/Extreme SSD,target=/data,type=bind",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
   "runArgs": [
     "--privileged",

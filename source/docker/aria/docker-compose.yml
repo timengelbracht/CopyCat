@@ -2,7 +2,7 @@ services:
   aria_dev:
     build: 
       context: . 
-      dockerfile: Dockerfile-complete-untested
+      dockerfile: Dockerfile
     container_name: aria_dev
     network_mode: "host"
     privileged: true   
