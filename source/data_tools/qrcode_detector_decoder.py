@@ -5,16 +5,27 @@ from datetime import datetime
 from time_aligner import TimeAligner
 from typing import List, Tuple
 from tqdm import tqdm
+from pyzbar.pyzbar import decode, ZBarSymbol
+from qreader import QReader
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
 
 class QRCodeDetectorDecoder:
+
+    # code patterns used to split actions within the same recording
+    CODES = {
+        "yellow": "0I0R.119T5DY.MIXEDREALITY",
+        "blue": "0H0R.119T5DY.MIXEDREALITY"
+    }
+    _qr_reader = QReader(model_size='s', min_confidence=0.4) 
+
     def __init__(self, frame_dir: Path, ext=".jpg"):
         self.frame_dir = frame_dir
         self.ext = ext
         self.qr = cv2.QRCodeDetector()
-        # self.frame_index_at_detection = None
-        # self.frame_timestamp_at_detection = None
-        # self.qr_timestamp_at_detection = None
         self.logging_tag = f"[{self.__class__.__name__}]"
+
 
     def parse_gopro_qr(self, qr_text: str) -> int:
 
@@ -52,67 +63,110 @@ class QRCodeDetectorDecoder:
         return timestamp_ns
 
     def find_first_valid_qr(self, stride: int = 1) -> Tuple[int, int]:
-        frame_files = sorted(self.frame_dir.glob(f"*{self.ext}"), key=lambda p: int(p.stem))
-        for frame_path in tqdm(frame_files[::stride], desc=f"Searching for valid QR codes in {self.frame_dir.name}"):
+        files = sorted(self.frame_dir.glob(f"*{self.ext}"),
+                       key=lambda p: int(p.stem))
+
+        hits = 0
+        for frame_path in tqdm(files[::stride],
+                               desc=f"Scanning {self.frame_dir.name}"):
             img = cv2.imread(str(frame_path))
             if img is None:
                 continue
 
-            # val, points, _ = self.qr.detectAndDecode(img)
+            # payload = decode_qr_opti(img)
+            decoded = self._qr_reader.detect_and_decode(img, return_detections=False)
+            if not decoded or not decoded[0]:
+                continue
+            payload = decoded[0]
+            # if payload == '':
+            #     # 
+            #     continue
+
             try:
-                retval_detect, points = self.qr.detect(img)
-            except: 
+                timestamp_ns = self.parse_gopro_qr(payload)
+            except ValueError as e:
+                print(f"[!] Failed to parse QR: {e}")
                 continue
-            if retval_detect and points is not None and cv2.contourArea(points) > 0:
-                retval_decode, _ = self.qr.decode(img, points)
-                if retval_decode != "":
-                    try:
-                        timestamp_ns = self.parse_gopro_qr(retval_decode)
-                    except ValueError as e:
-                        print(f"[!] Failed to parse QR code: {e}")
-                        continue
 
-                    print(f"[{self.logging_tag}] Found valid QR in: {frame_path.name} → {timestamp_ns} ns")
-                    #               (device_time, utc_time)
-                    return (int(frame_path.stem), timestamp_ns)
+            print(f"[{self.logging_tag}] QR in {frame_path.name} → {timestamp_ns} ns")
+            return int(frame_path.stem), timestamp_ns
 
-        print(f"[{self.logging_tag}] No valid QR code found in the directory.")
-        return (None, None)
+        print(f"[{self.logging_tag}] No valid QR found in directory.")
+        return None, None
     
-    def find_all_valid_interaction_qrs(self, qr_decoded_text: str, min_rel_area: float = 0.15) -> List[tuple[int, int]]:
+
+    def find_all_valid_interaction_qrs(self) -> List[int]:
         """
-        Find all valid QR codes in the frame directory that match the specified decoded text pattern.
-        Returns a list of tuples (frame_index, timestamp_ns).
+        Scan frames (every other frame for speed) and return a list of frame
+        timestamps (in nanoseconds, taken from filename stems) where a decoded
+        QR payload matches one of `self.CODES.values()`.
 
-        :param qr_decoded_text: The text pattern to match against the decoded QR codes.
-        :param min_rel_area: Minimum relative area of the QR code contour to consider it valid. 
         """
-        all_qrs = []
-        frame_files = sorted(self.frame_dir.glob(f"*{self.ext}"), key=lambda p: int(p.stem))
+        all_hits = []
 
-        h, w = cv2.imread(str(frame_files[0])).shape[:2]
-        min_area = min_rel_area * h * w
+        files = sorted(self.frame_dir.glob(f"*{self.ext}"),
+                    key=lambda p: int(p.stem))
+        if not files:
+            return []
 
-        for frame_path in frame_files:
+        # Optional: quick sanity read of the first image (not strictly required here)
+        first_img = cv2.imread(str(files[0]))
+        if first_img is None:
+            return [] 
+
+        for frame_path in tqdm(files[::3], desc=f"Scanning {self.frame_dir.name}"):
+            t = int(frame_path.stem)
+
             img = cv2.imread(str(frame_path))
+
             if img is None:
                 continue
+            decoded = self._qr_reader.detect_and_decode(img, return_detections=False)
+            if not decoded or not decoded[0]:
+                continue
+            payload = decoded[0]
+            
+            # payload = decode_qr_opti(img)
+            if payload in self.CODES.values():
+                all_hits.append(t)
+                print(f"[{self.logging_tag}] QR in {frame_path.name} → {t} ns")
 
-            retval_detect, points = self.qr.detect(img)
-            if retval_detect and points is not None and cv2.contourArea(points) > min_area:
-                retval_decode, _ = self.qr.decode(img, points)
-                if retval_decode != "":
-                    try:
-                        timestamp_ns = self.parse_gopro_qr(retval_decode)
-                    except ValueError as e:
-                        print(f"[!] Failed to parse QR code: {e}")
-                        continue
+        return all_hits
 
-                    print(f"[{self.logging_tag}] Found valid QR in: {frame_path.name} → {timestamp_ns} ns")
-                    all_qrs.append((int(frame_path.stem), timestamp_ns))
+def decode_qr_opti(bgr: np.ndarray) -> str:
+    """
+    Try to decode a QR in `bgr` using:
+        1.  pyzbar (fast, needs sharp edges)
+        2.  QReader CNN (robust to blur / low contrast)
+    Returns the payload string, or '' if nothing was decoded.
+    """
+    # ---------------- common light pre‑proc -----------------------------
+    # gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-        return all_qrs
+    # unsharp mask
+    # blur  = cv2.GaussianBlur(gray, (0, 0), sigmaX=2)
+    # sharp = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
 
+    # # adaptive threshold
+    # th = cv2.adaptiveThreshold(
+    #     sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+    #     cv2.THRESH_BINARY, 31, 2)
+    
+    # -------------- 3) QReader deep model ------------------------------
+    # QReader expects RGB, so convert & upscale to help the model
+    # rgb_big = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+    #                      None, fx=2, fy=2,
+    #                      interpolation=cv2.INTER_CUBIC)
+    decoded = _qr_reader.detect_and_decode(bgr, return_detections=False)
+    if decoded and decoded[0]:
+        return decoded[0]
+
+    # # -------------- 1) ZBar (pyzbar) -----------------------------------
+    # syms = decode(th, symbols=[ZBarSymbol.QRCODE])
+    # if syms:
+    #     return syms[0].data.decode("utf‑8")
+
+    return ''
 
 if __name__ == "__main__":
 
