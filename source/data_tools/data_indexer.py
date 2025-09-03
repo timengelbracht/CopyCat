@@ -195,13 +195,48 @@ class RecordingIndex:
         location:    str | None = None,
         interaction: str | None = None,
         recorder:    str | None = None,
+        interaction_index: str | None = None,
     ) -> List[Path]:
         files: List[Path] = []
         # Use wildcard index so query always returns tuples ending with rec_dir
         for tpl in self.query(location, interaction, recorder,
-                              interaction_index="*"):
+                              interaction_index=interaction_index):
             files.extend(self.vrs_under_recorder(tpl[-1]))
         return files
+    
+    def get_all_extracted_data_streams(self, extraction_path: Path) -> List[Path]:
+        """
+        Returns every sub-directory (at any depth) that contains:
+        • a timestamp-named file like 0.png, 1634551234567.jpg, …  OR
+        • a file named data.csv
+
+        Parameters
+        ----------
+        root_dir : str | Path
+            Top-level directory to begin the search.
+
+        Returns
+        -------
+        List[Path]
+            Directories that satisfy the rule (deduplicated, absolute paths).
+        """
+        _TS_RE = re.compile(r"^\d+\.(png|jpe?g|npy)$", re.IGNORECASE)
+
+        extraction_path = Path(extraction_path).expanduser().resolve()
+        hits: list[Path] = []
+
+        for dir_path, _, filenames in os.walk(extraction_path):
+            fn_lower = [f.lower() for f in filenames]
+
+            # 1 data.csv present → store full path to the CSV
+            if "data.csv" in fn_lower:
+                hits.append(Path(dir_path) / "data.csv")
+
+            # 2 any timestamp-style file present → store the directory path
+            if any(_TS_RE.match(name) for name in fn_lower):
+                hits.append(Path(dir_path))
+
+        return hits
 
 
 # ── example usage & quick test ────────────────────────────────────────────
