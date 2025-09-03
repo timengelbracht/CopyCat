@@ -30,34 +30,18 @@ from torchvision import transforms, models
 import cv2
 import shutil
 
+from utils_keyframing import KeyframeExtractor
 
 class AriaData:
+
+    ARIA_USERNAME = "zurich_y6vx1s"
+    ARIA_PASSWORD = "zurich0001"
 
     # monodepth model setup
     DEVICE, _, _ = get_backend()
     MONO_DEPTH_CHECKPOINT = "depth-anything/Depth-Anything-V2-base-hf"
     PIPE_MONO_DEPTH = pipeline("depth-estimation", model=MONO_DEPTH_CHECKPOINT, device=DEVICE)
 
-    # DINOv2 model setup
-    DINO_CHECKPOINT = "facebook/dinov2-small-imagenet1k-1-layer"
-    PIPE_DINO = pipeline("image-feature-extraction", model=DINO_CHECKPOINT, device=DEVICE, pool=True)
-
-    # global image descriptor setup for keyframing
-    BACKBONE = models.resnet50(pretrained=True)
-    POOL     = BACKBONE.avgpool
-    FEAT_EX  = torch.nn.Sequential(
-        *(list(BACKBONE.children())[:-2]),
-        POOL, torch.nn.Flatten()
-    ).eval().cuda()
-    PREPROCESS = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485,0.456,0.406],
-            std= [0.229,0.224,0.225],
-        ),
-    ])
 
     def __init__(self, base_path: Path, 
                  rec_loc: str, 
@@ -74,6 +58,7 @@ class AriaData:
         self.rec_type = rec_type
         self.interaction_indices = interaction_indices
 
+        self.extraction_path_base = self.base_path / "extracted" / self.rec_loc / self.rec_type
         self.extraction_path = self.base_path / "extracted" / self.rec_loc / self.rec_type / self.rec_module / f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}_vrs"
 
         self.mps_path_raw = self.base_path / "raw" / self.rec_loc / self.rec_type / self.rec_module / f"mps_{self.rec_loc}_{self.interaction_indices}_{self.rec_type}_vrs"
@@ -83,6 +68,8 @@ class AriaData:
         self.label_rgb = f"/camera_rgb"
         self.label_rgb_raw = f"/camera_rgb_raw"
         self.label_slam = f"/slam"
+        self.label_hand_tracking = f"/hand_tracking"
+        self.label_eye_gaze = f"/eye_gaze"
         self.label_keyframes = f"visual_registration/keyframes/rgb"
         self.label_keyframes_raw = f"/keyframes_raw/rgb"
         self.label_depth = f"/camera_depth"
@@ -90,6 +77,13 @@ class AriaData:
         self.label_clt = f"{self.label_slam}/closed_loop_trajectory"
         self.label_sdp = f"{self.label_slam}/semidense_points"
         self.label_sdpd = f"{self.label_slam}/semidense_points_downsampled"
+
+        self.label_clt_aligned = f"{self.label_slam}/closed_loop_trajectory_aligned"
+        self.label_sdp_aligned = f"{self.label_slam}/semidense_points_aligned"
+        self.label_sdpd_aligned = f"{self.label_slam}/semidense_points_downsampled_aligned"
+        self.label_hand_tracking_aligned = f"{self.label_hand_tracking}/hand_tracking_aligned"
+        self.label_palm_and_wrist_tracking_aligned = f"{self.label_hand_tracking}/palm_and_wrist_tracking_aligned"
+        self.label_eye_gaze_aligned = f"{self.label_eye_gaze}/general_eye_gaze_aligned"
 
         self.semidense_points_ply_path = self.extraction_path / self.label_sdp.strip("/") / "data.ply"
         self.semidense_points_downsampled_ply_path = self.extraction_path / self.label_sdpd.strip("/") / "data.ply"
@@ -99,7 +93,7 @@ class AriaData:
         self.provider = None
         self.load_provider()
 
-        self.calibration = self.get_calibration(undistort=True)
+        self.calibration = self.get_calibration()
 
         self.extracted_vrs = Path(self.extraction_path / self.label_rgb.strip("/")).exists()
         self.extracted_vrs_raw = Path(self.extraction_path / self.label_rgb_raw.strip("/")).exists()
@@ -112,14 +106,7 @@ class AriaData:
 
         self.rgb_extension = ".png"  # Assuming RGB images are in PNG format
 
-        self.statistics = {
-            "keypoints_per_image": [],
-            "motion_blur_per_image": [],
-            "average_depth_per_image": [],
-            "average_depth_range_per_image": [],
-            "relative_depth_range_per_image": [],
-            "depth_cv_per_image": []
-        }
+        self.statistics = {}
 
 
     def _extracted(self, label: str) -> bool:
@@ -139,7 +126,7 @@ class AriaData:
 
         self.device_calib = self.provider.get_device_calibration()
 
-    def get_calibration(self, undistort: bool = True) -> np.ndarray:
+    def get_calibration(self) -> np.ndarray:
 
         """
         Returns the intrinsic matrix for the RGB camera.
@@ -148,53 +135,64 @@ class AriaData:
 
         if not self.device_calib:
             raise RuntimeError("Device calibration not loaded")
-        
+        calib = {}
         clb = {}
 
-        if undistort:
-            f = self.device_calib.get_camera_calib("camera-rgb").get_focal_lengths()[0]
-            h = self.device_calib.get_camera_calib("camera-rgb").get_image_size()[0]
-            w = self.device_calib.get_camera_calib("camera-rgb").get_image_size()[1]
 
-            pinhole = calibration.get_linear_camera_calibration(w, h, f)
-            pinhole_rot = calibration.rotate_camera_calib_cw90deg(pinhole)
-            f_x = pinhole_rot.get_projection_params()[0]
-            f_y = pinhole_rot.get_projection_params()[1]
-            c_x = pinhole_rot.get_projection_params()[2]
-            c_y = pinhole_rot.get_projection_params()[3]
-            K = np.array([f_x, 0, c_x, 0, f_y, c_y, 0, 0, 1]).reshape(3, 3)
+        f = self.device_calib.get_camera_calib("camera-rgb").get_focal_lengths()[0]
+        h = self.device_calib.get_camera_calib("camera-rgb").get_image_size()[0]
+        w = self.device_calib.get_camera_calib("camera-rgb").get_image_size()[1]
 
-            clb["K"] = K
-            clb["h"] = h
-            clb["w"] = w
-            clb["model"] = "PINHOLE"
-            clb["distortion"] = np.zeros(5, dtype=np.float32)
-            clb["focal_length"] = np.array([f_x, f_y], dtype=np.float32)
-            clb["principal_point"] = np.array([c_x, c_y], dtype=np.float32)
-            clb["pinhole_T_device_camera"] = pinhole_rot.get_transform_device_camera().to_matrix()
-            clb["T_device_camera"] = self.device_calib.get_camera_calib("camera-rgb").get_transform_device_camera().to_matrix()
+        pinhole = calibration.get_linear_camera_calibration(w, h, f)
+        pinhole_rot = calibration.rotate_camera_calib_cw90deg(pinhole)
+        f_x = pinhole_rot.get_projection_params()[0]
+        f_y = pinhole_rot.get_projection_params()[1]
+        c_x = pinhole_rot.get_projection_params()[2]
+        c_y = pinhole_rot.get_projection_params()[3]
+        K = np.array([f_x, 0, c_x, 0, f_y, c_y, 0, 0, 1]).reshape(3, 3)
 
-            return clb
-        else:
-            calib = self.device_calib.get_camera_calib("camera-rgb")
+        clb["K"] = K
+        clb["h"] = h
+        clb["w"] = w
+        clb["model"] = "PINHOLE"
+        clb["distortion"] = np.zeros(5, dtype=np.float32)
+        clb["focal_length"] = np.array([f_x, f_y], dtype=np.float32)
+        clb["principal_point"] = np.array([c_x, c_y], dtype=np.float32)
+        clb["pinhole_T_device_camera"] = pinhole_rot.get_transform_device_camera().to_matrix()
+        clb["T_device_camera"] = self.device_calib.get_camera_calib("camera-rgb").get_transform_device_camera().to_matrix()
 
-            h, w = calib.get_image_size()
-            f_x = calib.get_focal_lengths()[0]
-            f_y = calib.get_focal_lengths()[1]
-            c_x = calib.get_principal_point()[0]
-            c_y = calib.get_principal_point()[1]
-            K = np.array([f_x, 0, c_x, 0, f_y, c_y, 0, 0, 1]).reshape(3, 3)
+        clb["colmap_camera_cfg"] = {
+            "model":  "PINHOLE",
+            "width":   w,
+            "height":  h,
+            "params": [f_x, f_y, c_x, c_y],
+        }
+        calib = {"PINHOLE": clb}
 
-            clb["K"] = K
-            clb["h"] = h
-            clb["w"] = w
-            clb["model"] = "FISHEYE"
-            clb["distortion"] = calib.get_projection_params()[3:7]
-            clb["focal_length"] = np.array([f_x, f_y], dtype=np.float32)
-            clb["principal_point"] = np.array([c_x, c_y], dtype=np.float32)
-            clb["T_device_camera"] = calib.get_transform_device_camera().to_matrix()
+        calib_rgb = self.device_calib.get_camera_calib("camera-rgb")
 
-            return clb
+        h, w = calib_rgb.get_image_size()
+        f_x = calib_rgb.get_focal_lengths()[0]
+        f_y = calib_rgb.get_focal_lengths()[1]
+        c_x = calib_rgb.get_principal_point()[0]
+        c_y = calib_rgb.get_principal_point()[1]
+        K = np.array([f_x, 0, c_x, 0, f_y, c_y, 0, 0, 1]).reshape(3, 3)
+
+        clb = {}
+        clb["K"] = K
+        clb["h"] = h
+        clb["w"] = w
+        clb["model"] = "FISHEYE_624"
+        clb["distortion"] = calib_rgb.get_projection_params()[3:7]
+        clb["focal_length"] = np.array([f_x, f_y], dtype=np.float32)
+        clb["principal_point"] = np.array([c_x, c_y], dtype=np.float32)
+        clb["T_device_camera"] = calib_rgb.get_transform_device_camera().to_matrix()
+
+        clb["colmap_camera_cfg"] = {}
+        
+        calib["NON_PINHOLE"] = clb
+        
+        return calib
         
     def request_mps(self, force: bool = False) -> None:
 
@@ -211,6 +209,8 @@ class AriaData:
         try: # will prompt for credentials
             mps_client.request_single(
                 input_path=str(self.vrs_file_raw),
+                username=self.ARIA_USERNAME,
+                password=self.ARIA_PASSWORD,
                 features=["SLAM", "HAND_TRACKING", "EYE_GAZE"],
                 force=force,
                 no_ui=True
@@ -230,6 +230,9 @@ class AriaData:
         if self.mps_path_raw_all_devices.exists() and len(list(self.mps_path_raw_all_devices.iterdir())) >= len(all_vrs_files) and not force:
             print(f"[{self.logging_tag}] MPS data for all devices already exists at {self.mps_path_raw_all_devices}")
             return
+        
+        if not self.mps_path_raw_all_devices.exists():
+            ensure_dir(self.mps_path_raw_all_devices)
         
         # try:
         mps_client.request_multi(
@@ -293,10 +296,6 @@ class AriaData:
 
     def extract_mps(self, mps_path: Optional[str | Path | os.PathLike] = None) -> None:
 
-        if self.extracted_mps:
-            print(f"[{self.logging_tag}] MPS data already extracted to {self.extraction_path}")
-            return
-
         # Path to closed loop SLAM trajectory
         closed_loop_trajectory_file = self.mps_path_raw / "slam" / "closed_loop_trajectory.csv"  # fixed typo in filename
         semidense_points_file = self.mps_path_raw / "slam" / "semidense_points.csv.gz"
@@ -305,13 +304,11 @@ class AriaData:
             df = pd.read_csv(closed_loop_trajectory_file)
         except Exception as e:
             print(f"[{self.logging_tag}] Failed to read CSV {closed_loop_trajectory_file}: {e}")
-            return
         
         try:
             df_pts = pd.read_csv(semidense_points_file, compression='gzip')
         except Exception as e:
             print(f"[{self.logging_tag}] Failed to read CSV {semidense_points_file}: {e}")
-            return
 
         # Normalize to 'timestamp' naming
         if "tracking_timestamp_us" in df.columns:
@@ -339,11 +336,74 @@ class AriaData:
             print(f"[{self.logging_tag}] Saved semidense points CSV: {csv_dir}/data.csv")
         else:
             print(f"[{self.logging_tag}] Semidense points CSV already exists: {csv_dir}/data.csv")
-            return
 
-        # TODO - add more mps data extraction as needed
-        # TODO - UTC timestamp is NOT changed at the moment, only device timestamp!!!!
-        
+        # hand and palm tracking
+        palm_tracking_file = self.mps_path_raw / "hand_tracking" / "wrist_and_palm_poses.csv"
+        hand_tracking_file = self.mps_path_raw / "hand_tracking" / "hand_tracking_results.csv"
+
+        try:
+            df_palm = pd.read_csv(palm_tracking_file)
+        except Exception as e:  
+            print(f"[{self.logging_tag}] Failed to read CSV {palm_tracking_file}: {e}")
+
+        try:
+            df_hand = pd.read_csv(hand_tracking_file)
+        except Exception as e:
+            print(f"[{self.logging_tag}] Failed to read CSV {hand_tracking_file}: {e}")
+
+        # Normalize to 'timestamp' naming
+        if "tracking_timestamp_us" in df_palm.columns:
+            df_palm["tracking_timestamp_us"] = (df_palm["tracking_timestamp_us"].astype(np.int64) * 1_000)
+            df_palm.rename(columns={"tracking_timestamp_us": "timestamp"}, inplace=True)
+
+        if "tracking_timestamp_us" in df_hand.columns:
+            df_hand["tracking_timestamp_us"] = (df_hand["tracking_timestamp_us"].astype(np.int64) * 1_000)
+            df_hand.rename(columns={"tracking_timestamp_us": "timestamp"}, inplace=True)
+
+        # Save palm tracking data
+        label_palm = f"{self.label_hand_tracking}/palm_and_wrist_tracking"
+        csv_dir = self.extraction_path / label_palm.strip("/")
+        if not csv_dir.exists():
+            ensure_dir(csv_dir)
+            df_palm.to_csv(csv_dir / "data.csv", index=False)
+            print(f"[{self.logging_tag}] Saved palm tracking CSV: {csv_dir}/data.csv")
+        else:
+            print(f"[{self.logging_tag}] Palm tracking CSV already exists: {csv_dir}/data.csv")
+
+        # Save hand tracking data
+        label_hand = f"{self.label_hand_tracking}/hand_tracking"
+        csv_dir = self.extraction_path / label_hand.strip("/")
+        if not csv_dir.exists():
+            ensure_dir(csv_dir)
+            df_hand.to_csv(csv_dir / "data.csv", index=False)
+            print(f"[{self.logging_tag}] Saved hand tracking CSV: {csv_dir}/data.csv")
+        else:
+            print(f"[{self.logging_tag}] Hand tracking CSV already exists: {csv_dir}/data.csv")
+
+        # eye gaze tracking
+        eye_gaze_file = self.mps_path_raw / "eye_gaze" / "general_eye_gaze.csv"   
+
+        try:
+            df_eye_gaze = pd.read_csv(eye_gaze_file)
+        except Exception as e:
+            print(f"[{self.logging_tag}] Failed to read CSV {eye_gaze_file}: {e}")
+
+        # Normalize to 'timestamp' naming
+        if "tracking_timestamp_us" in df_eye_gaze.columns: 
+            df_eye_gaze["tracking_timestamp_us"] = (df_eye_gaze["tracking_timestamp_us"].astype(np.int64) * 1_000)
+            df_eye_gaze.rename(columns={"tracking_timestamp_us": "timestamp"}, inplace=True)
+
+        # Save eye gaze tracking data
+        label_eye_gaze = f"{self.label_eye_gaze}/general_eye_gaze"
+        csv_dir = self.extraction_path / label_eye_gaze.strip("/")
+        if not csv_dir.exists():
+            ensure_dir(csv_dir)
+            df_eye_gaze.to_csv(csv_dir / "data.csv", index=False)
+            print(f"[{self.logging_tag}] Saved eye gaze tracking CSV: {csv_dir}/data.csv")
+        else:
+            print(f"[{self.logging_tag}] Eye gaze tracking CSV already exists: {csv_dir}/data.csv")
+
+
         # Update extracted flag
         self.extracted_mps = True
         print(f"[{self.logging_tag}] Extracted MPS data to {csv_dir}")
@@ -354,7 +414,9 @@ class AriaData:
         """
 
         all_vrs_files = self.data_indexer.vrs_files(
-            location=self.rec_loc
+            location=self.rec_loc,
+            interaction_index= self.interaction_indices
+            
         )
 
         if not self.mps_path_raw_all_devices.exists() or len(list(self.mps_path_raw_all_devices.iterdir())) < len(all_vrs_files) :
@@ -520,61 +582,7 @@ class AriaData:
 
         print(f"[{self.logging_tag}] done! depth maps in {out_dir}")
 
-    # def extract_keyframes(self, undistort: bool = False, only_first_frame: bool = True) -> None:
-    #     """
-    #     Returns the keyframes as a numpy array.
-    #     Reads every `stride`-th image from the directory.
-    #     """
-
-    #     if not self.extracted_vrs:
-    #         raise FileNotFoundError(f"[{self.logging_tag}] VRS data not extracted to {self.extraction_path}")
-        
-    #     if not self.extracted_mps:
-    #         raise FileNotFoundError(f"[{self.logging_tag}] MPS data not extracted to {self.extraction_path}")
-
-    #     if undistort:
-    #         in_dir = self.extraction_path / self.label_rgb.strip("/")
-    #         out_dir = self.visual_registration_output_path / self.label_keyframes.strip("/")
-    #     else:
-    #         in_dir = self.extraction_path / self.label_rgb_raw.strip("/")
-    #         out_dir = self.visual_registration_output_path / self.label_keyframes_raw.strip("/")
-
-    #     ensure_dir(out_dir)
-
-    #     # get first mps pose timestamp as it takes some time to initialize
-    #     # i.e. the first frame might not have a pose yet
-    #     mps_traj = self.get_closed_loop_trajectory()
-    #     time_zero = mps_traj["timestamp"].iloc[0]
-
-    #     # Get sorted list of image files (assumes naming like 0.png, 1.png, ...)
-    #     image_files = sorted(
-    #         Path(in_dir).glob("*.png"),
-    #         key=lambda x: int(x.stem)
-    #     )
-
-    #     # remove images before first mps pose
-    #     image_files_valid = [img for img in image_files if int(img.stem) >= time_zero]
-
-    #     if only_first_frame:
-    #         img = cv2.imread(str(image_files_valid[0]))
-    #         if img is not None:
-    #             (out_dir / f"{image_files_valid[0].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
-    #     else:
-    #         L = len(image_files_valid)
-    #         indices = np.linspace(0, L - 1, num=min(15, L), dtype=int)
-    #         for i in indices:
-    #             img = cv2.imread(str(image_files_valid[i]))
-    #             if img is not None:
-    #                 (out_dir / f"{image_files_valid[i].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
-
-    def extract_keyframes(self, 
-                                n_keyframes: int = 20,
-                                stride: int = 2,
-                                feature_percentile: float = 10.0,
-                                depth_percentile: float = 75.0,
-                                blur_percentile: float = 10.0,
-                                force: bool = False) -> None:
-
+    def extract_keyframes(self, stride: int = 2, n_keyframes: int = 20, force: bool = False) -> None:
 
         if self._extracted(self.label_keyframes) and not force:
             print(f"[{self.logging_tag}] Keyframes already extracted to {self.visual_registration_output_path / self.label_keyframes.strip('/')}")
@@ -595,75 +603,29 @@ class AriaData:
         out_dir = self.extraction_path / self.label_keyframes.strip("/")
         ensure_dir(out_dir)
 
-        if not any(self.statistics.values()):
-            print(f"[{self.logging_tag}] No statistics found, computing...")
-            self.get_statistics(stride=stride)
-        
         rgb_files = sorted(
             self.extraction_path.glob(f"{self.label_rgb.strip('/')}/**/*.png"),
             key=lambda x: int(x.stem)
         )
 
-        depth_dir = self.extraction_path / self.label_depth.strip("/")
+        depth_files = sorted(
+            self.extraction_path.glob(f"{self.label_depth.strip('/')}/**/*.npy"),
+            key=lambda x: int(x.stem)
+        )
+    
+        # setup the keyframe extractor
+        keyframe_extractor = KeyframeExtractor(
+            rgb_files=rgb_files,
+            depth_files=depth_files,
+            n_keyframes=n_keyframes,
+            stride=stride)
 
-        # 2) Compute thresholds
-        feats = np.array(self.statistics["keypoints_per_image"])
-        depths = np.array(self.statistics["average_depth_per_image"])
-        blurs = np.array(self.statistics["motion_blur_per_image"])
-
-        feat_thr  = np.percentile(feats, feature_percentile)        # drop bottom X%
-        depth_thr = np.percentile(depths, depth_percentile)     # keep top (100-X)%
-        blur_thr  = np.percentile(blurs, blur_percentile)
-
-        # corresponding stats lists (already pure Python types)
-        feats_list  = self.statistics["keypoints_per_image"]
-        depths_list = self.statistics["average_depth_per_image"]
-        blurs_list  = self.statistics["motion_blur_per_image"]
-
-        candidates = []
-        for p, kp_count, mean_d, blur_var in zip(rgb_files, feats_list, depths_list, blurs_list):
-            # fast threshold checks
-            if kp_count  < feat_thr:  continue
-            if mean_d    < depth_thr: continue
-            if blur_var  < blur_thr:  continue
-            candidates.append(p)
-
-        if not candidates:
-            print(f"[{self.logging_tag}] No frames passed filtering.")
-            return
-
-        descs = []
-        batch_size = 16
-        for i in tqdm(range(0, len(candidates), batch_size), desc="Extracting DINO features"):
-            batch = candidates[i : i + batch_size]
-
-            # load as PIL RGB
-            pil_imgs = [ Image.open(str(p)).convert("RGB") for p in batch ]
-
-            # now call the pipeline
-            feats = self.PIPE_DINO(pil_imgs)  # returns list of [batch_size, 1, dim]
-
-            for out in feats: # dim [1, D]
-                descs.append(np.asarray(out[0]))
-
-        descs = np.stack(descs)  # shape [N, D]
-
-        # 3) Farthest‐point sampling
-        N = len(descs)
-        if N <= n_keyframes:
-            selected = list(range(N))
-        else:
-            selected = [0]
-            min_dists = np.full(N, np.inf)
-            for _ in range(1, n_keyframes):
-                last = selected[-1]
-                dists = np.linalg.norm(descs - descs[last], axis=1)
-                min_dists = np.minimum(min_dists, dists)
-                sel = int(np.argmax(min_dists))
-                selected.append(sel)
-
-        # 4) Collect, save list, and copy images
-        self.selected_keyframes = [candidates[i] for i in selected]
+        if not any(self.statistics.values()):
+            print(f"[{self.logging_tag}] No statistics found, computing...")
+            self.get_statistics(stride=stride)
+        
+        keyframe_extractor.statistics = self.statistics
+        self.selected_keyframes = keyframe_extractor.extract_keyframes()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # write the list
@@ -687,6 +649,60 @@ class AriaData:
 
         if not Path(csv_dir).exists():
             raise FileNotFoundError(f"Closed loop trajectory CSV not found: {csv_dir}")
+        
+        df = pd.read_csv(csv_dir)
+        return df
+    
+    def get_hand_tracking(self) -> pd.DataFrame:
+        """
+        Returns the palm tracking data as a pandas DataFrame.
+        """
+
+        csv_dir = self.extraction_path / self.label_hand_tracking.strip("/") / "hand_tracking" / "data.csv"
+    
+        if not csv_dir.exists():
+            raise FileNotFoundError(f"Hand tracking CSV not found: {csv_dir}")
+        
+        df = pd.read_csv(csv_dir)
+        return df
+    
+    def get_palm_and_wrist_tracking(self) -> pd.DataFrame:
+        """
+        Returns the palm tracking data as a pandas DataFrame.
+        """
+        
+        csv_dir = self.extraction_path / self.label_hand_tracking.strip("/") / "palm_and_wrist_tracking" / "data.csv"
+        if not csv_dir.exists():
+            raise FileNotFoundError(f"Palm tracking CSV not found: {csv_dir}")
+        
+        df = pd.read_csv(csv_dir)
+        return df
+    
+
+    def get_closed_loop_trajectory_aligned(self) -> pd.DataFrame:
+        """ Returns the closed loop trajectory aligned as a pandas DataFrame.
+        """
+
+        csv_dir = self.extraction_path / self.label_clt_aligned.strip("/") / "data.csv"
+        if not csv_dir.exists():
+            raise FileNotFoundError(f"Closed loop trajectory aligned CSV not found: {csv_dir}")
+        
+        df = pd.read_csv(csv_dir)
+        return df
+
+    def get_seidense_points_aligned_df(self) -> pd.DataFrame:
+        pass
+
+    def get_hand_tracking_aligned_df(self) -> pd.DataFrame:
+        pass
+
+    def get_palm_and_wrist_tracking_aligned(self) -> pd.DataFrame:
+        """ Returns the palm tracking aligned data as a pandas DataFrame.
+        """
+        
+        csv_dir = self.extraction_path / self.label_palm_and_wrist_tracking_aligned.strip("/") / "data.csv"
+        if not csv_dir.exists():
+            raise FileNotFoundError(f"Palm tracking aligned CSV not found: {csv_dir}")
         
         df = pd.read_csv(csv_dir)
         return df
@@ -882,118 +898,27 @@ class AriaData:
             self.extraction_path.glob(f"{self.label_rgb.strip('/')}/**/*{self.rgb_extension}"),
             key=lambda x: int(x.stem)
         )
-        # stride the RGB files
-        rgb_files = rgb_files[::stride]
-        
+
         # get depth files sorted by timestamp
         depth_files = sorted(
             self.extraction_path.glob(f"{self.label_depth.strip('/')}/**/*.npy"),
             key=lambda x: int(x.stem)
         )
-        # stride the depth files
-        depth_files = depth_files[::stride]
+
+        keyframe_extractor = KeyframeExtractor(
+            rgb_files=rgb_files,
+            depth_files=depth_files,
+            n_keyframes=20,
+            stride=stride
+        )
+
+        self.statistics = keyframe_extractor.get_statistics(
+            force=force
+        )
         
-        # depth statistics
-        average_depth_per_image = []
-        average_depth_range_per_image = []
-        relative_depth_range_per_image = []
-        depth_cv_per_image = []
-        for depth_file in tqdm(depth_files, desc=f"[{self.logging_tag}] Processing depth statistics", unit="file"):
-            depth_map = np.load(depth_file)
-            if depth_map.size == 0:
-                continue
-            average_depth = np.mean(depth_map)
-            average_depth_per_image.append(average_depth)
+        # Save the statistics to a JSON file
+        self.save_statistics(statistics_file)
 
-            d = depth_map.flatten()
-            d = d[~np.isnan(d)]
-
-            mean_d  = np.mean(d)
-            std_d   = np.std(d)
-            depth_cv = std_d / (mean_d + 1e-6)
-
-            p5, p95 = np.percentile(d, [5, 95])
-            depth_prange = (p95 - p5) / (p95 + 1e-6)
-
-            relative_depth_range_per_image.append(float(depth_prange))
-            depth_cv_per_image.append(float(depth_cv))
-            average_depth_range = np.max(depth_map) - np.min(depth_map)
-            average_depth_range_per_image.append(float(average_depth_range))
-
-        # local feature statistics (ORB)
-        orb = cv2.ORB_create()
-        keypoints_per_image = []
-        for rgb_file in tqdm(rgb_files, desc=f"[{self.logging_tag}] Processing RGB statistics", unit="file"):
-            img = cv2.imread(str(rgb_file))
-            if img is None:
-                continue
-            keypoints, _ = orb.detectAndCompute(img, None)
-            keypoints_per_image.append(int(len(keypoints)))  
-
-        # motion blur statistics
-        motion_blur_per_image = []
-        for rgb_file in tqdm(rgb_files, desc=f"[{self.logging_tag}] Processing RGB files for motion blur", unit="file"):
-            img = cv2.imread(str(rgb_file))
-            if img is None:
-                continue
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            # Calculate Laplacian variance
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            motion_blur_per_image.append(float(laplacian_var))
-
-        self.statistics = {
-            "keypoints_per_image": keypoints_per_image,
-            "motion_blur_per_image": motion_blur_per_image,
-            "average_depth_per_image": average_depth_per_image,
-            "average_depth_range_per_image": average_depth_range_per_image,
-            "relative_depth_range_per_image": relative_depth_range_per_image,
-            "depth_cv_per_image": depth_cv_per_image
-        }
-
-        # save statistics to file
-        self.save_statistics()
-
-        if visualize:
-            fig, axes = plt.subplots(3, 2, figsize=(15, 12), constrained_layout=True)
-
-            # Top‑left: Keypoints per Image
-            axes[0, 0].hist(keypoints_per_image, bins=50, color='green', alpha=0.7)
-            axes[0, 0].set_title(f"Keypoints per Image ({self.rec_loc})")
-            axes[0, 0].set_xlabel("Number of Keypoints")
-            axes[0, 0].set_ylabel("Frequency")
-            axes[0, 0].grid(True)
-            # Top‑right: Motion Blur per Image
-            axes[0, 1].hist(motion_blur_per_image, bins=50, color='blue', alpha=0.7)
-            axes[0, 1].set_title(f"Motion Blur (Laplacian Var) ({self.rec_loc})")
-            axes[0, 1].set_xlabel("Laplacian Variance")
-            axes[0, 1].set_ylabel("Frequency")
-            axes[0, 1].grid(True)
-            # Middle‑left: Avg Depth per Image
-            axes[1, 0].hist(average_depth_per_image, bins=50, alpha=0.7, color='teal')
-            axes[1, 0].set_title(f"Avg Depth per Image ({self.rec_loc})")
-            axes[1, 0].set_xlabel("Depth (m)")
-            axes[1, 0].set_ylabel("Frequency")
-            axes[1, 0].grid(True)
-            # Middle‑right: Avg Depth Range per Image
-            axes[1, 1].hist(average_depth_range_per_image, bins=50, alpha=0.7, color='red')
-            axes[1, 1].set_title(f"Avg Depth Range per Image ({self.rec_loc})")
-            axes[1, 1].set_xlabel("Range (m)")
-            axes[1, 1].set_ylabel("Frequency")
-            axes[1, 1].grid(True)
-            # Bottom‑left: Relative Depth Range
-            axes[2, 0].hist(relative_depth_range_per_image, bins=50, alpha=0.7, color='orange')
-            axes[2, 0].set_title(f"Relative Depth Range ({self.rec_loc})")
-            axes[2, 0].set_xlabel("Relative Range")
-            axes[2, 0].set_ylabel("Frequency")
-            axes[2, 0].grid(True)
-            # Bottom‑right: Depth CoV per Image
-            axes[2, 1].hist(depth_cv_per_image, bins=50, alpha=0.7, color='purple')
-            axes[2, 1].set_title(f"Depth Coefficient of Variation ({self.rec_loc})")
-            axes[2, 1].set_xlabel("Coefficient (sigma/mu)")
-            axes[2, 1].set_ylabel("Frequency")
-            axes[2, 1].grid(True)
-            plt.show()
 
     def save_statistics(self, out_path: str | Path | None = None) -> None:
         """
@@ -1076,7 +1001,7 @@ if __name__ == "__main__":
         aria_queries_at_loc = data_indexer.query(
             location=rec_location, 
             interaction="gripper", 
-            recorder="aria_human"
+            recorder="aria_gripper"
         )
 
         for loc, inter, rec, ii, path in aria_queries_at_loc:

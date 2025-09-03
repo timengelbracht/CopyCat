@@ -15,6 +15,7 @@ from scipy.spatial.transform import Rotation as R
 from data_indexer import RecordingIndex
 import os
 import scipy.io as sio
+import shutil
 
 class LeicaData:
     def __init__(self, base_path: Path, rec_loc: str, initial_setup: str, voxel: float = 0.05) -> None:
@@ -62,6 +63,21 @@ class LeicaData:
         setups = [s[0:3] for s in setups]  # take only the first 3 characters
         self.setups = sorted(set(setups))  # unique setups
 
+        # Check for existing mesh files and copy the one with the lowest number
+        mesh_files = [f for f in raw_files if "mesh" in f.stem and f.suffix == ".ply"]
+        if mesh_files:
+            # Sort setup directories by name and pick the one with the lowest name
+            lowest_setup_dir = self.extraction_path / sorted(self.setups)[0]
+            target_mesh_dir = lowest_setup_dir / self.label_mesh
+            target_mesh_dir.mkdir(parents=True, exist_ok=True)
+            target_mesh_file = target_mesh_dir / "mesh.ply"
+            
+            # Sort mesh files by their numeric part and pick the one with the lowest number
+            mesh_file = mesh_files[0]
+            
+            if not target_mesh_file.exists():
+                shutil.copy(mesh_file, target_mesh_file)
+            print(f"[Leica] Copied {mesh_file.name} to {target_mesh_file}")
 
         for setup in self.setups:
             pattern = f"Setup {setup}"
@@ -84,8 +100,8 @@ class LeicaData:
                     target_file = setup_dir / self.label_images / file.name
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     if not target_file.exists():
-                        file.rename(target_file)
-                        print(f"[Leica] Moved {file.name} to {target_file}")
+                        shutil.copy(file, target_file)
+                        print(f"[Leica] Copied {file.name} to {target_file}")
 
         print(f"[Leica] Extracted {len(self.setups)} setups from {self.rec_loc}.")
 
@@ -183,7 +199,7 @@ class LeicaData:
 
         panos = {}
 
-        panos["depth"] = depth_pano
+
         panos["rgb"] = rgb_pano
         panos["pose"] = self._parse_pano_pose(pose_info_file)
         
@@ -192,7 +208,7 @@ class LeicaData:
     def _points_e57_to_ply(self, e57_path: str | Path, ply_path: str | Path) -> None:
 
         e57 = pye57.E57(str(e57_path))
-        data = e57.read_scan(self.scan_idx, colors=True, ignore_missing_fields=True)
+        data = e57.read_scan(0, colors=True, ignore_missing_fields=True)
 
         xyz = np.column_stack(
             (data["cartesianX"], data["cartesianY"], data["cartesianZ"])
@@ -225,7 +241,7 @@ class LeicaData:
         
         print(f"[Leica] Saved full-resolution PLY at {ply_path}")
 
-    def make_rendered_360_views(self, setup: str | None = None) -> None:
+    def make_360_views_from_render(self, setup: str | None = None) -> None:
         
         if setup is None:
             setup = self.setups[0]  # default to first setup
@@ -315,7 +331,6 @@ class LeicaData:
         print(f"[Leica] Rendered {N* 2} rotating tripod views → {out_dir/'images'}")
 
     def make_360_views_from_pano(self, setup: str | None = None) -> None:
-        # TODO visualize the camera fustrum in the panorama/pcd
         """
         Slice a full-equirect pano into 45degx45deg pinhole crops (32 total),
         writing both RGB + depth tiles + 3D points and a per-tile JSON with intrinsics+pose.
@@ -325,22 +340,28 @@ class LeicaData:
 
         pano_data = self.get_panos(setup=setup)
         rgb_pano  = pano_data["rgb"]
-        depth_pano= pano_data["depth"]
+
         meta      = pano_data["pose"] ["HDR"]
            # {"t": [...], "q": [...]}
 
         # load once
         equi_rgb   = rgb_pano
-        equi_depth = depth_pano
+
 
         # output dirs
         out_base = self.extraction_path / setup / "pano_tiles"
+
+        if out_base.exists() and any(out_base.iterdir()):
+            print(f"[LEICA] Pano tiles already exist for setup {setup} at {out_base}.")
+            return
+        
         rgb_out  = out_base / "rgb"
         depth_out= out_base / "depth"
         depth_vis_out = out_base / "depth_vis"
         pose_out = out_base / "poses"
         xyz_out = out_base / "xyz"
         for d in (rgb_out, depth_out, pose_out, xyz_out, depth_vis_out):
+
             d.mkdir(parents=True, exist_ok=True)
 
         # tiling params
@@ -565,58 +586,6 @@ class LeicaData:
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_WRAP
         )
-    
-    def _render_equirect_depth(self,
-                               pcd: o3d.geometry.PointCloud,
-                               width: int,
-                               height: int,
-                               vis: bool = True) -> np.ndarray:
-        """
-        Render depth from a point cloud as an equirectangular image.
-        Args:
-            pcd: Open3D point cloud.
-            width: Width of the output equirectangular image.
-            height: Height of the output equirectangular image.
-        Returns:
-            depth: Depth image as a NumPy array of shape (height, width).
-        """
-
-
-        vox = self._pcd_to_voxel_grid(pcd, voxel=self.voxel)
-        
-        scene = o3d.t.geometry.RaycastingScene()
-        _ = scene.add_voxel_grid(vox)
-
-        # build longitude/latitude rays
-        lon = (np.arange(width)   / width)  * 2*np.pi - np.pi     # [-π, +π]
-        lat = (0.5 - np.arange(height) / height) * np.pi          # [+π/2…−π/2]
-        lon, lat = np.meshgrid(lon, lat)
-        dirs = np.stack([ np.sin(lon)*np.cos(lat),
-                        np.sin(lat),
-                        np.cos(lon)*np.cos(lat)], -1)   # shape (H,W,3)
-        dirs = dirs.reshape(-1,3).astype(np.float32)
-
-        origin = np.zeros_like(dirs)                 # scanner at (0,0,0)
-        rays = np.hstack([origin, dirs])
-        ans = scene.cast_rays(o3d.core.Tensor(rays))
-        depth = ans['t_hit'].numpy().reshape(height, width)
-        depth[depth == np.inf] = 0.0
-
-        if vis:
-            # visualize depth plt
-            import matplotlib.pyplot as plt
-            cmap = plt.get_cmap('plasma')
-            vmin = np.nanmin(depth[depth > 0])          # ignore zeros if they mark missing rays
-            vmax = np.nanmax(depth)
-
-            plt.figure(figsize=(8, 6))
-            plt.imshow(depth, vmin=vmin, vmax=vmax, cmap=cmap)
-            plt.colorbar(label='depth (m)')
-            plt.axis('off')
-            plt.tight_layout()
-            plt.show()
-
-        return depth
 
     def _depth_to_world_xyz(self, depth: np.ndarray, K: np.ndarray, w_T_wc: np.ndarray) -> np.ndarray:
         
@@ -962,6 +931,7 @@ class LeicaData:
 
 if __name__ == "__main__":
     from pathlib import Path
+
 
     base_path = Path(f"/data/ikea_recordings")
     rec_location = "bedroom_1"

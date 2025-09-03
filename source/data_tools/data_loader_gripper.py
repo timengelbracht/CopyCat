@@ -14,15 +14,22 @@ import pandas as pd
 import os
 import numpy as np
 import shutil
+from scipy.signal import butter, filtfilt
 
 import open3d as o3d
 import time
 import json
+from utils_bag import get_topics_from_bag
 
 from utils import parse_str_ros_geoemtry_msgs_pose
 from utils_parsing import flatten_dict, ros_to_dict, ROS_MESSAGE_PARSING_CONFIG, ros_message_to_dict_recursive
 
 from data_indexer import RecordingIndex
+from utils_yaml import load_camchain, load_imucam, load_imu
+import json
+
+from data_loader_aria import AriaData
+from utils_calibration import _slerp_pose_series_to_targets, compensate_wrench_batch, find_contact_free_segments, _estimate_tool_params_ls
 
 class GripperData:
 
@@ -50,7 +57,9 @@ class GripperData:
                  rec_type: str,
                  rec_module: str,
                  interaction_indices: Optional[str] = None,
-                 data_indexer: Optional[RecordingIndex] = None):
+                 data_indexer: Optional[RecordingIndex] = None,
+                 color: str = "yellow"
+):
 
         self.rec_loc = rec_loc
         self.base_path = base_path
@@ -67,6 +76,19 @@ class GripperData:
         self.label_rgb = "/zedm/zed_node/left_raw/image_raw_color"
         self.rgb_extension = ".png"  # Assuming RGB images are in PNG format
 
+        self.logging_tag = f"{self.rec_loc}_{self.rec_type}_{self.rec_module}".upper()
+        self.color = color
+        self.calibration = self.get_calibration()
+
+        self.loader_aria_gripper = AriaData(
+            base_path=self.base_path,
+            rec_loc=self.rec_loc,
+            rec_type=self.rec_type,
+            rec_module="aria_gripper",
+            interaction_indices=self.interaction_indices,
+            data_indexer=data_indexer
+        )
+
         # self.visual_registration_output_path = self.extraction_path / "visual_registration"
         # self.svo_output_path = self.extraction_path / "svo"
         # self.points_ply_path = self.extraction_path / "points" / "data.ply"
@@ -76,7 +98,117 @@ class GripperData:
         # self.zed = None
 
         self.rgb_extension = ".png"
-        self.logging_tag = f"{self.rec_loc}_{self.rec_type}_{self.rec_module}".upper()
+       
+        
+
+    def get_calibration(self):
+        """
+        load metadata from camera calibration file
+        """
+        # types of calibration models taht we calibrated beforehand
+        # pinhole-equi for pycolmap/ hloc
+        # omni-radtan for openvins
+        calibration = {}
+
+        calib_path = self.extraction_path / "calib"
+        calib_path_raw = self.base_path / "raw" / "calib" / f"gripper_{self.color}"
+
+        if not calib_path.exists():
+            print(f"[{self.logging_tag}] No calibration file found at {calib_path}")
+            # copy all contents in raw to calib_path
+            shutil.copytree(calib_path_raw, calib_path)
+            print(f"[{self.logging_tag}] Copied calibration files from {calib_path_raw} to {calib_path}")
+
+
+        calib_path_cam_imu = calib_path
+        # calib_path_gravity_compensation = calib_path / "gravity_comp"
+
+        file = calib_path_cam_imu.glob("*camchain.yaml")
+        file_imucam = calib_path_cam_imu.glob("*imucam.yaml")
+        file_imu = calib_path_cam_imu.glob("*imu.yaml")
+
+        calib_file = next(file, None)
+        if calib_file is None:
+            print(f"[{self.logging_tag}] No calibration file found at {calib_path}")
+            raise FileNotFoundError(f"No calibration file found at {calib_path}")
+
+        calib_file_imucam = next(file_imucam, None)
+        if calib_file_imucam is None:
+            print(f"[{self.logging_tag}] No IMU calibration file found at {calib_path}")
+            raise FileNotFoundError(f"No IMU calibration file found at {calib_path}")
+        
+        calib_file_imu = next(file_imu, None)
+        if calib_file_imu is None:
+            print(f"[{self.logging_tag}] No IMU calibration file found at {calib_path}")
+            raise FileNotFoundError(f"No IMU calibration file found at {calib_path}")
+
+        print(f"[{self.logging_tag}] Loading calibration file {calib_file}")
+        print(f"[{self.logging_tag}] Loading IMU calibration file {calib_file_imucam}")
+
+        calibration = {}
+        cams = ["cam0", "cam1", "cam2"]
+        for cam_name in cams:
+            calib_data = load_camchain(calib_file, cam_name=cam_name)
+            calib_data_imu = load_imucam(calib_file_imucam, imu_name=cam_name)
+
+            clb = {}
+            h = calib_data.resolution[1]
+            w = calib_data.resolution[0]
+            f_x, f_y = calib_data.intrinsics[0], calib_data.intrinsics[1]
+            c_x, c_y = calib_data.intrinsics[2], calib_data.intrinsics[3]
+            disortion = calib_data.distortion
+            timeshift_cam_imu = calib_data_imu.timeshift_cam_imu
+            T_cam_imu = calib_data_imu.T_cam_imu
+
+            K = np.array([
+                [f_x, 0, c_x],
+                [0, f_y, c_y],
+                [0, 0, 1]
+            ], dtype=np.float32)
+
+            # convert to dictionary
+            if calib_data.model == "pinhole" and calib_data.distortion_model == "equidistant":
+                model = "OPENCV_FISHEYE"
+                type = "PINHOLE"
+                colmap_camera_cfg = {
+                "model":  model,
+                "width":   w,
+                "height":  h,
+                "params": [f_x, f_y, c_x, c_y] + disortion,
+                }
+
+            elif calib_data.model == "pinhole" and calib_data.distortion_model == "radtan":
+                model = "PINHOLE"
+                colmap_camera_cfg = {
+                    "model":  model,
+                    "width":   w,
+                    "height":  h,
+                    "params": [f_x, f_y, c_x, c_y] + disortion,
+                }
+
+            clb["K"] = K
+            clb["model"] = model
+            clb["w"] = w
+            clb["h"] = h
+            clb["focal_length"] = np.array([f_x, f_y], dtype=np.float32)
+            clb["principal_point"] = np.array([c_x, c_y], dtype=np.float32)
+            clb["distortion"] = np.array(disortion, dtype=np.float32)
+            clb["colmap_camera_cfg"] = colmap_camera_cfg
+            clb["T_cam_imu"] = np.array(T_cam_imu, dtype=np.float32) 
+            clb["timeshift_cam_imu"] = timeshift_cam_imu
+
+            calibration[cam_name] = clb
+
+        calib_data_imu = load_imu(calib_file_imu, imu_name="imu0")
+        T_imu_body = calib_data_imu.T_imu_body
+        T_imu_tool = calib_data_imu.T_imu_tool
+        T_imu_sensor = calib_data_imu.T_imu_sensor
+        calibration["imu0"] = {}
+        calibration["imu0"]["T_imu_body"] = np.array(T_imu_body, dtype=np.float32)
+        calibration["imu0"]["T_imu_tool"] = np.array(T_imu_tool, dtype=np.float32)
+        calibration["imu0"]["T_imu_sensor"] = np.array(T_imu_sensor, dtype=np.float32)
+
+        return calibration
 
     def extract_bag_full(self):
 
@@ -89,121 +221,101 @@ class GripperData:
 
         print(f"[{self.logging_tag}] Reading from: {self.bag}")
 
+        # TODO test
+        get_topics_from_bag(self.IMAGE_TOPICS, self.NON_IMAGE_TOPICS, self.bag, self.extraction_path)
+
         # This will now store lists of *nested dictionaries* for each topic
-        parsed_non_image_data: Dict[str, List[Dict[str, Any]]] = \
-            {topic: [] for topic in self.NON_IMAGE_TOPICS.keys()}
+        # parsed_non_image_data: Dict[str, List[Dict[str, Any]]] = \
+        #     {topic: [] for topic in self.NON_IMAGE_TOPICS.keys()}
 
-        with AnyReader([self.bag]) as reader:
-            for conn, bag_time, raw in tqdm(reader.messages(),
-                                            total=getattr(reader, "message_count", None)):
-                topic = conn.topic
+        # with AnyReader([self.bag]) as reader:
+        #     for conn, bag_time, raw in tqdm(reader.messages(),
+        #                                     total=getattr(reader, "message_count", None)):
+        #         topic = conn.topic
                 
-                # Filter for topics we explicitly listed
-                if topic not in self.IMAGE_TOPICS and topic not in self.NON_IMAGE_TOPICS.keys():
-                    continue
+        #         # Filter for topics we explicitly listed
+        #         if topic not in self.IMAGE_TOPICS and topic not in self.NON_IMAGE_TOPICS.keys():
+        #             continue
 
-                msg = reader.deserialize(raw, conn.msgtype)
+        #         msg = reader.deserialize(raw, conn.msgtype)
 
-
-                # --- Universal Timestamp Extraction ---
-                ts: int
-                if hasattr(msg, "header") and hasattr(msg.header, "stamp"):
-                    # ROS 2 message timestamps usually directly accessible
-                    if hasattr(msg.header.stamp, 'sec') and hasattr(msg.header.stamp, 'nanosec'):
-                        ts = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                    else: # Fallback for ROS 1 or other stamp types with to_nsec()
-                         try:
-                             ts = msg.header.stamp.to_nsec()
-                         except AttributeError:
-                             print(f"Warning: Could not get nsec from {topic} header.stamp. Falling back to bag_time.")
-                             ts = bag_time.to_nsec() if hasattr(bag_time, "to_nsec") else int(bag_time)
-                else: # No header, use bag message time
-                    ts = bag_time.to_nsec() if hasattr(bag_time, "to_nsec") else int(bag_time)
+        #         # --- Universal Timestamp Extraction ---
+        #         ts: int
+        #         if hasattr(msg, "header") and hasattr(msg.header, "stamp"):
+        #             # ROS 2 message timestamps usually directly accessible
+        #             if hasattr(msg.header.stamp, 'sec') and hasattr(msg.header.stamp, 'nanosec'):
+        #                 ts = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        #             else: # Fallback for ROS 1 or other stamp types with to_nsec()
+        #                  try:
+        #                      ts = msg.header.stamp.to_nsec()
+        #                  except AttributeError:
+        #                      print(f"Warning: Could not get nsec from {topic} header.stamp. Falling back to bag_time.")
+        #                      ts = bag_time.to_nsec() if hasattr(bag_time, "to_nsec") else int(bag_time)
+        #         else: # No header, use bag message time
+        #             ts = bag_time.to_nsec() if hasattr(bag_time, "to_nsec") else int(bag_time)
                 
-                ts_str = str(ts)
+        #         ts_str = str(ts)
 
-                # --- IMAGE TOPICS Handling ---
-                if topic in self.IMAGE_TOPICS:
-                    try:
-                        img = message_to_cvimage(msg)
-                        img_dir = self.extraction_path / topic.strip("/")
-                        img_dir.mkdir(parents=True, exist_ok=True)
+        #         # --- IMAGE TOPICS Handling ---
+        #         if topic in self.IMAGE_TOPICS:
+        #             try:
+        #                 img = message_to_cvimage(msg)
+        #                 img_dir = self.extraction_path / topic.strip("/")
+        #                 img_dir.mkdir(parents=True, exist_ok=True)
 
-                        if hasattr(msg, 'encoding') and msg.encoding == "32FC1": # Depth images
-                            np.save(img_dir / f"{ts_str}.npy", img)
+        #                 if hasattr(msg, 'encoding') and msg.encoding == "32FC1": # Depth images
+        #                     np.save(img_dir / f"{ts_str}.npy", img)
 
-                            # Visualization for depth
-                            vis_dir = self.extraction_path / f"{topic.strip('/')}_visualization"
-                            vis_dir.mkdir(parents=True, exist_ok=True)
+        #                     # Visualization for depth
+        #                     vis_dir = self.extraction_path / f"{topic.strip('/')}_visualization"
+        #                     vis_dir.mkdir(parents=True, exist_ok=True)
                             
-                            min_d, max_d = 0.0, 5.0
-                            norm = np.clip(np.nan_to_num(img), min_d, max_d)
-                            norm = ((norm - min_d) / (max_d - min_d) * 255).astype(np.uint8)
-                            heat = cv2.applyColorMap(norm, cv2.COLORMAP_VIRIDIS)
-                            cv2.imwrite(vis_dir / f"{ts_str}.png", heat)
-                        elif hasattr(msg, 'encoding') and msg.encoding == "bgra8": # BGRA images
-                            cv2.imwrite(img_dir / f"{ts_str}.png", cv2.cvtColor(img, cv2.COLOR_BGRA2BGR))
-                        else: # Default to BGR8 (common for color images)
-                            cv2.imwrite(img_dir / f"{ts_str}.png", img)
-                    except Exception as e:
-                        print(f"[!] Failed to decode image @ {ts} on {topic}: {e}")
-                    continue # Image topics are handled, move to the next message
+        #                     min_d, max_d = 0.0, 5.0
+        #                     norm = np.clip(np.nan_to_num(img), min_d, max_d)
+        #                     norm = ((norm - min_d) / (max_d - min_d) * 255).astype(np.uint8)
+        #                     heat = cv2.applyColorMap(norm, cv2.COLORMAP_VIRIDIS)
+        #                     cv2.imwrite(vis_dir / f"{ts_str}.png", heat)
+        #                 elif hasattr(msg, 'encoding') and msg.encoding == "bgra8": # BGRA images
+        #                     cv2.imwrite(img_dir / f"{ts_str}.png", cv2.cvtColor(img, cv2.COLOR_BGRA2BGR))
+        #                 else: # Default to BGR8 (common for color images)
+        #                     cv2.imwrite(img_dir / f"{ts_str}.png", img)
+        #             except Exception as e:
+        #                 print(f"[!] Failed to decode image @ {ts} on {topic}: {e}")
+        #             continue # Image topics are handled, move to the next message
 
-                # --- NON-IMAGE TOPICS - Direct Parsing and Storage ---
-                try:
-                    # Convert the ROS message object directly to a nested Python dictionary
-                    parsed_msg_dict = ros_message_to_dict_recursive(msg)
+        #         # --- NON-IMAGE TOPICS - Direct Parsing and Storage ---
+        #         try:
+        #             # Convert the ROS message object directly to a nested Python dictionary
+        #             parsed_msg_dict = ros_message_to_dict_recursive(msg)
                     
-                    # Add the universal timestamp at the top level of the dictionary
-                    # This ensures all extracted data has a consistent timestamp key.
-                    parsed_msg_dict['timestamp'] = ts
+        #             # Add the universal timestamp at the top level of the dictionary
+        #             # This ensures all extracted data has a consistent timestamp key.
+        #             parsed_msg_dict['timestamp'] = ts
 
-                    parsed_non_image_data[topic].append(parsed_msg_dict)
-                except Exception as e:
-                    print(f"[!] Failed to parse and extract data from {topic}: {e}")
+        #             parsed_non_image_data[topic].append(parsed_msg_dict)
+        #         except Exception as e:
+        #             print(f"[!] Failed to parse and extract data from {topic}: {e}")
 
-        # --- Dump Parsed Data to Structured Files ---
-        # Instead of CSV, we'll save to JSON Lines or Parquet.
+        # # --- Dump Parsed Data to Structured Files ---
+        # # Instead of CSV, we'll save to JSON Lines or Parquet.
         
-        for topic_name, messages_list in parsed_non_image_data.items():
-            if not messages_list:
-                print(f"[INFO] No data extracted for topic: {topic_name}. Skipping file dump.")
-                continue
+        # for topic_name, messages_list in parsed_non_image_data.items():
+        #     if not messages_list:
+        #         print(f"[INFO] No data extracted for topic: {topic_name}. Skipping file dump.")
+        #         continue
 
-            output_dir = self.extraction_path / topic_name.strip("/")
-            output_dir.mkdir(parents=True, exist_ok=True)
+        #     output_dir = self.extraction_path / topic_name.strip("/")
+        #     output_dir.mkdir(parents=True, exist_ok=True)
 
-            # === Save as JSONL ===
-            # jsonl_path = output_dir / "data.jsonl"
-            # with open(jsonl_path, 'w') as f:
-            #     for msg_dict in messages_list:
-            #         json.dump(msg_dict, f)
-            #         f.write('\n')
-            # print(f"[✓] Saved JSON Lines: {jsonl_path}")
-
-            # === Save as Parquet ===
-            # try:
-            #     import pyarrow as pa
-            #     import pyarrow.parquet as pq
-            #     table = pa.Table.from_pylist(messages_list)
-            #     parquet_path = output_dir / "data.parquet"
-            #     pq.write_table(table, parquet_path)
-            #     print(f"[✓] Saved Parquet: {parquet_path}")
-            # except ImportError:
-            #     print(f"[!] pyarrow not installed. Skipping Parquet export for {topic_name}.")
-            # except Exception as e:
-            #     print(f"[!] Failed to save Parquet for {topic_name}: {e}")
-
-            # === Save as CSV ===
-            try:
-                # Flatten each dict in the list
-                flat_messages = [flatten_dict(msg_dict) for msg_dict in messages_list]
-                df = pd.DataFrame(flat_messages)
-                csv_path = output_dir / "data.csv"
-                df.to_csv(csv_path, index=False)
-                print(f"[✓] Saved CSV: {csv_path}")
-            except Exception as e:
-                print(f"[!] Failed to save CSV for {topic_name}: {e}")
+        #     try:
+        #         # Flatten each dict in the list
+        #         flat_messages = [flatten_dict(msg_dict) for msg_dict in messages_list]
+        #         df = pd.DataFrame(flat_messages)
+        #         csv_path = output_dir / "data.csv"
+        #         df.to_csv(csv_path, index=False)
+        #         print(f"[✓] Saved CSV: {csv_path}")
+        #     except Exception as e:
+        #         print(f"[!] Failed to save CSV for {topic_name}: {e}")
 
                 
         self.extracted_bag = True # Update the instance state
@@ -379,254 +491,217 @@ class GripperData:
 
             video.release()
             print(f"[✓] Saved video for {topic} at {video_path}")
-
-    def get_trajectory(self) -> pd.DataFrame:
-        """Return the trajectory as a pandas DataFrame"""
-        # TODO add covariance extraction
-        csv_dir = self.extraction_path / self.TOPICS["/zedm/zed_node/pose_with_covariance"].strip("/") / "data.csv"
-
-        if not Path(csv_dir).exists():
-            raise FileNotFoundError(f"Trajectory CSV not found: {csv_dir}")
-        
-        df = pd.read_csv(csv_dir)
-        df[["tx", "ty", "tz", "qx", "qy", "qz", "qw"]] = df["pose.pose"].apply(parse_str_ros_geoemtry_msgs_pose)
-        cleaned_df = df[["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]]
-
-        return cleaned_df
     
-    # def _get_zed_from_svo(self, svo_path: str | None = None) -> sl.Camera:
-    #     """Get ZED camera from SVO file."""
-
-    #     if svo_path is None:
-    #         svo_path = self.svo_output_path / "data.svo"
-    #     if not svo_path:
-    #         raise FileNotFoundError("[GRIPPER] No SVO file found. Please extract the SVO first.")
-        
-    #     zed = sl.Camera()
-    #     input_type = sl.InputType()
-    #     input_type.set_from_svo_file(str(svo_path))
-        
-    #     init_params = sl.InitParameters(input_t=input_type)
-    #     init_params.coordinate_units = sl.UNIT.METER
-    #     init_params.depth_mode = sl.DEPTH_MODE.ULTRA
-    #     init_params.camera_resolution = sl.RESOLUTION.HD720
-        
-    #     status = zed.open(init_params)
-    #     if status != sl.ERROR_CODE.SUCCESS:
-    #         raise RuntimeError(f"Failed to open SVO file: {status}")
-        
-    #     return zed
-    
-    # def _close_zed(self) -> None:
-    #     """Close ZED camera."""
-    #     if self.zed is not None:
-    #         self.zed.close()
-    #         self.zed = None
-    #     else:
-    #         print("[!] ZED camera is not open.")
-        
-    # def show_svo_recording(self):
-
-    #     if self.zed is None:
-    #         self.zed = self._get_zed_from_svo()
-
-    #     runtime_params = sl.RuntimeParameters()
-
-    #     frame_count = 0
-    #     while True:
-    #         if self.zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
-    #             break
-    #         image = sl.Mat()
-    #         depth_map = sl.Mat()
-    #         self.zed.retrieve_image(depth_map, sl.VIEW.DEPTH)
-    #         self.zed.retrieve_image(image, sl.VIEW.LEFT)
-    #         image_np = image.get_data()
-    #         timestamp_ns = self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
-    #         cv2.imshow("ZED SVO", image_np)
-    #         frame_count += 1
-    #         print(f"Timestamp: {timestamp_ns}")
-    #         if cv2.waitKey(1) & 0xFF == ord('q'):
-    #             break
-    #     cv2.destroyAllWindows()
-    #     self._close_zed()
-
-    # def save_trajectory_as_ply(self, color: tuple = (1.0, 0.0, 0.0)):
+    # def get_closed_loop_trajectory(self) -> pd.DataFrame:
     #     """
-    #     Save trajectory positions as a point cloud PLY file.
-        
-    #     Args:
-    #         df: DataFrame with columns ['tx', 'ty', 'tz']
-    #         ply_path: Output path for the PLY file
-    #         color: RGB color tuple for all points (0.0–1.0)
+    #     Extracts the closed-loop trajectory from gripper aria data.
     #     """
-    #     df = self.get_trajectory()
-    #     # df = self.get_trajectory_from_svo()
+        
+    #     # get the unaligned mps trajectory from aria gripper data
+    #     df = self.loader_aria_gripper.get_closed_loop_trajectory()
 
-    #     ply_path = self.traj_ply_path
-
-    #     if not {"tx", "ty", "tz"}.issubset(df.columns):
-    #         raise ValueError("DataFrame must contain 'tx', 'ty', 'tz' columns")
-
-    #     positions = df[["tx", "ty", "tz"]].to_numpy()
-    #     pcd = o3d.geometry.PointCloud()
-    #     pcd.points = o3d.utility.Vector3dVector(positions)
-
-    #     color_np = np.array([color], dtype=np.float32).repeat(len(positions), axis=0)
-    #     pcd.colors = o3d.utility.Vector3dVector(color_np)
-
-    #     ply_path = Path(ply_path)
-    #     ply_path.parent.mkdir(parents=True, exist_ok=True)
-    #     o3d.io.write_point_cloud(str(ply_path), pcd)
-    #     print(f"[GRIPPER] ✅ Saved trajectory as PLY → {ply_path}")
-
-    # def get_trajectory_from_svo(self, svo_path: str | None = None) -> pd.DataFrame:
-    #     """Get the trajectory from SVO file."""
-
-    #     if self.zed is None:
-    #         self.zed = self._get_zed_from_svo(svo_path)
-
-    #     if svo_path is None:
-    #         svo_path = self.svo_output_path / "data.svo"
-
-    #     tracking_params = sl.PositionalTrackingParameters()
-    #     self.zed.enable_positional_tracking(tracking_params)
-    #     runtime_params = sl.RuntimeParameters()
-    #     pose = sl.Pose()
-    #     timestamps, poses = [], []
-
-    #     while True:
-    #         if self.zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
-    #             break
-
-    #         # Get timestamp and pose
-    #         timestamp = self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
-
-    #         if self.zed.get_position(pose) == sl.POSITIONAL_TRACKING_STATE.OK:
-    #             t = pose.get_translation()
-    #             r = pose.get_orientation()
-
-    #             poses.append([
-    #                 t.get()[0], t.get()[1], t.get()[2],  # tx, ty, tz
-    #                 r.get()[0], r.get()[1], r.get()[2], r.get()[3],  # qx, qy, qz, qw
-    #             ])
-    #             timestamps.append(timestamp)
-
-    #     self.zed.disable_positional_tracking()
-    #     self._close_zed()
-
-    #     df = pd.DataFrame(poses, columns=["tx", "ty", "tz", "qx", "qy", "qz", "qw"])
-    #     df["timestamp"] = timestamps
-    #     df_svo = df[["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"]]
-    #     df_ros = self.get_trajectory()
-
-    #     # df.to_csv(out_csv, index=False)
-    #     # print(f"✅ Saved trajectory with {len(df)} poses to {out_csv}")
-
-    #     return df_svo
+    #     return df
     
-    # def visualize_svo_trajectory(self):
-
-    #     import matplotlib.pyplot as plt
-
-    #     if self.zed is None:
-    #         self.zed = self._get_zed_from_svo()
-
-    #     tracking_params = sl.PositionalTrackingParameters()
-    #     if self.zed.enable_positional_tracking(tracking_params) != sl.ERROR_CODE.SUCCESS:
-    #         print("Failed to enable tracking")
-    #         exit(1)
-
-    #     # === Grab trajectory ===
-    #     runtime_params = sl.RuntimeParameters()
-    #     pose = sl.Pose()
-    #     positions = []
-
-    #     while True:
-    #         if self.zed.grab(runtime_params) == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
-    #             break
-    #         if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
-    #             if self.zed.get_position(pose, sl.REFERENCE_FRAME.WORLD) == sl.POSITIONAL_TRACKING_STATE.OK:
-    #                 t = pose.get_translation(sl.Translation()).get()
-    #                 positions.append(t)
-
-    #     self.zed.disable_positional_tracking()
-    #     self._close_zed()
-
-    #     positions = np.array(positions)
-    #     print(f"Read {len(positions)} poses")
-
-    #     # === Plot the 3D trajectory ===
-    #     fig = plt.figure()
-    #     ax = fig.add_subplot(111, projection='3d')
-    #     ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], label="Trajectory")
-    #     ax.set_xlabel("X [m]")
-    #     ax.set_ylabel("Y [m]")
-    #     ax.set_zlabel("Z [m]")
-    #     ax.set_title("Camera Trajectory from SVO")
-    #     ax.legend()
-    #     plt.show()
-
-    # def _points_raw_to_ply(self, svo_path: str | None = None, output_ply_path: str | None = None) -> None:
-    #     """Extract fused point cloud from a ZED SVO and save as PLY."""
+    def get_force_torque_measurements(self) -> pd.DataFrame:
+        """
+        Extracts force-torque measurements from the gripper data.
+        """
         
-    #     if self.zed is None:
-    #         self.zed = self._get_zed_from_svo()
+        # get the unaligned force-torque measurements from aria gripper data
+        file = self.extraction_path / ("/force_torque/ft_sensor0/ft_sensor_readings/wrench").strip("/") / "data.csv"
 
-    #     if svo_path is None:
-    #         svo_path = self.svo_output_path / "data.svo"
-
-    #     if output_ply_path is None:
-    #         output_ply_path = self.points_ply_path
-
-    #     # --- Enable positional tracking ---
-    #     tracking_params = sl.PositionalTrackingParameters()
-    #     if self.zed.enable_positional_tracking(tracking_params) != sl.ERROR_CODE.SUCCESS:
-    #         self._close_zed()
-    #         raise RuntimeError("[GRIPPER] Failed to enable positional tracking")
-
-    #     # --- Enable spatial mapping (fused point cloud only) ---
-    #     map_params = sl.SpatialMappingParameters(
-    #         resolution=sl.MAPPING_RESOLUTION.HIGH,
-    #         mapping_range=sl.MAPPING_RANGE.AUTO,
-    #         save_texture=False,
-    #         use_chunk_only=True,
-    #         map_type=sl.SPATIAL_MAP_TYPE.FUSED_POINT_CLOUD
-    #     )
-    #     if self.zed.enable_spatial_mapping(map_params) != sl.ERROR_CODE.SUCCESS:
-    #         self._close_zed()
-    #         raise RuntimeError("[GRIPPER] Failed to enable spatial mapping")
-
-    #     runtime_params = sl.RuntimeParameters()
-    #     fused_map = sl.FusedPointCloud()
+        if not file.exists():
+            raise FileNotFoundError(f"Force-torque data file not found: {file}")
         
-    #     # --- Process SVO until the end ---
-    #     while True:
-    #         if self.zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
-    #             break
+        df = pd.read_csv(file)
 
-    #         self.zed.request_spatial_map_async()
+        return df
 
 
+    def apply_force_torque_gravity_compensation(self, visualize: bool = False) -> pd.DataFrame:
+        
+        df_ft = self.get_force_torque_measurements()
+        # doesnt need to be aligned closed loop traj since z axis is along gravity for both aria and leica system
+        df_poses = self.loader_aria_gripper.get_closed_loop_trajectory()
 
-    #     # --- Extract and save fused map ---
+        # wrench in ft frame (sensor)
+        wrench_ft = df_ft[["timestamp", "wrench.force.x", "wrench.force.y", "wrench.force.z",
+                                        "wrench.torque.x", "wrench.torque.y", "wrench.torque.z"]]
+        wrench_timestamps_ns = wrench_ft["timestamp"].to_numpy(dtype=np.int64)
 
-    #     if self.zed.get_spatial_map_request_status_async() == sl.ERROR_CODE.SUCCESS:
-    #         self.zed.extract_whole_spatial_map(fused_map)
+        f_meas_S = wrench_ft[["wrench.force.x", "wrench.force.y", "wrench.force.z"]].to_numpy(dtype=np.float64)  # (N, 3)
+        tau_meas_S = wrench_ft[["wrench.torque.x", "wrench.torque.y", "wrench.torque.z"]].to_numpy(dtype=np.float64)
 
-    #     output_path = Path(output_ply_path)
-    #     output_path.parent.mkdir(parents=True, exist_ok=True)
-    #     fused_map.save(str(output_path), sl.MESH_FILE_FORMAT.PLY)
+        # aria slam poses in aria world frame
+        poses_aria = df_poses[["timestamp", "tx_world_device", "ty_world_device", "tz_world_device",
+                                            "qx_world_device", "qy_world_device", "qz_world_device", "qw_world_device"]]
 
-    #     print(f"[GRIPPER] Saved fused point cloud to {output_path}")
+        R_ariaworld_ariadevice_list, t_ariaworld_ariadevice_list = _slerp_pose_series_to_targets(poses_aria, wrench_timestamps_ns)
+        R_ariaworld_ariadevice = np.array(R_ariaworld_ariadevice_list, dtype=np.float64)  # (N, 3, 3)
 
-    #     # --- Cleanup ---
-    #     self.zed.disable_spatial_mapping()
-    #     self.zed.disable_positional_tracking()
-    #     self._close_zed()
+        # TODO check if already applied
+        # TODO on the fly compensation with known mass and CoG using static parts off the measuremets
 
+        T_ariadevice_ariacam = self.loader_aria_gripper.calibration["NON_PINHOLE"]["T_device_camera"]
+        R_ariadevice_ariacam = T_ariadevice_ariacam[:3, :3]
+
+        T_ariacam_imuft = self.calibration["cam2"]["T_cam_imu"]
+        R_ariacam_imuft = T_ariacam_imuft[:3, :3]
+
+        # no rot between imu and imuft
+        R_ariacam_ft = R_ariacam_imuft
+
+        # rot from ft to ariadevice
+        R_ariadevice_ft = R_ariadevice_ariacam @ R_ariacam_ft
+        R_ariaworld_ft = R_ariaworld_ariadevice @ R_ariadevice_ft  # (N, 3, 3)
+        R_ft_ariaworld = np.transpose(R_ariaworld_ft, axes=(0, 2, 1))  # (N, 3, 3)
+
+        # compute contact-free segments for static estimation
+        windows, mask, dbg = find_contact_free_segments(
+            timestamps_ns=wrench_ft["timestamp"].to_numpy(np.int64),
+            F_meas_S=f_meas_S,
+            tau_meas_S=tau_meas_S,
+            R_S_W=R_ft_ariaworld,
+            m=0.490,                                  # your known/estimated mass
+            c_S=np.array([0.021, 0.020, 0.059]),      # your CoG in sensor frame
+            use_torque=False,                           # start with forces only
+            smooth_len=15,                              # ~150 ms if 100 Hz
+            k_thresh=1.0,
+            min_free_sec=5,
+            erode_sec=1.0,
+        )
+
+        # apply time window mask to measurements
+        f_meas_S_contact_free = f_meas_S[mask]
+        tau_meas_S_contact_free = tau_meas_S[mask]
+        R_ft_ariaworld_contact_free = R_ft_ariaworld[mask]
+
+        params = _estimate_tool_params_ls(
+            F_meas_S=f_meas_S_contact_free,
+            tau_meas_S=tau_meas_S_contact_free,
+            R_S_W_list=R_ft_ariaworld_contact_free,
+            m_known=0.490,
+            c_S_known=np.array([0.021, 0.020, 0.059]),
+            g=9.81
+        )
+
+        f_ext, tau_ext =compensate_wrench_batch(F_meas_S=f_meas_S,
+                                                tau_meas_S=tau_meas_S,
+                                                R_S_W= R_ft_ariaworld,
+                                                params=params,)
+        
+        # add froces and torques to the DataFrame
+        df_ft["wrench_ext.force.x"] = f_ext[:, 0]
+        df_ft["wrench_ext.force.y"] = f_ext[:, 1]
+        df_ft["wrench_ext.force.z"] = f_ext[:, 2]
+        df_ft["wrench_ext.torque.x"] = tau_ext[:, 0]
+        df_ft["wrench_ext.torque.y"] = tau_ext[:, 1]
+        df_ft["wrench_ext.torque.z"] = tau_ext[:, 2]
+
+        # filtering 
+        CUTOFF_HZ = 15.0   # tune: ~10–25 Hz works well for F/T
+        ORDER = 4
+        # --- sampling rate from ns timestamps ---
+        t = (df_ft["timestamp"].to_numpy() - df_ft["timestamp"].iloc[0]) * 1e-9
+        dt = np.median(np.diff(t))
+        fs = 1.0 / dt
+        b, a = butter(ORDER, CUTOFF_HZ / (0.5 * fs), btype="low")
+
+        for col in ["wrench_ext.force.x", "wrench_ext.force.y", "wrench_ext.force.z",
+                    "wrench_ext.torque.x", "wrench_ext.torque.y", "wrench_ext.torque.z"]:
+            df_ft[col + "_filt"] = filtfilt(b, a, df_ft[col].to_numpy())
+            
+        # save the compensated force-torque measurements
+        file = self.extraction_path / ("/force_torque/ft_sensor0/ft_sensor_readings/wrench").strip("/") / "data.csv"
+
+        df_ft.to_csv(file, index=False)
+
+        if visualize:
+            fig = plt.figure(figsize=(18, 8))
+
+            # 1) Non-compensated forces
+            ax1 = plt.subplot(2, 3, 1)
+            ax1.plot(df_ft["timestamp"], df_ft["wrench.force.x"], label="Fx")
+            ax1.plot(df_ft["timestamp"], df_ft["wrench.force.y"], label="Fy")
+            ax1.plot(df_ft["timestamp"], df_ft["wrench.force.z"], label="Fz")
+            ax1.set_title("Non-Compensated Forces"); ax1.set_xlabel("Timestamp (ns)"); ax1.set_ylabel("Force (N)"); ax1.legend()
+
+            # 2) Compensated forces
+            ax2 = plt.subplot(2, 3, 2)
+            ax2.plot(df_ft["timestamp"], df_ft["wrench_ext.force.x"], label="Fx")
+            ax2.plot(df_ft["timestamp"], df_ft["wrench_ext.force.y"], label="Fy")
+            ax2.plot(df_ft["timestamp"], df_ft["wrench_ext.force.z"], label="Fz")
+            ax2.set_title("Compensated Forces"); ax2.set_xlabel("Timestamp (ns)"); ax2.set_ylabel("Force (N)"); ax2.legend()
+
+            # 3) Filtered forces
+            ax3 = plt.subplot(2, 3, 3)
+            ax3.plot(df_ft["timestamp"], df_ft["wrench_ext.force.x_filt"], label="Fx (filt)")
+            ax3.plot(df_ft["timestamp"], df_ft["wrench_ext.force.y_filt"], label="Fy (filt)")
+            ax3.plot(df_ft["timestamp"], df_ft["wrench_ext.force.z_filt"], label="Fz (filt)")
+            ax3.set_title(f"Filtered Forces (Butter {ORDER}, {CUTOFF_HZ:g} Hz)"); ax3.set_xlabel("Timestamp (ns)"); ax3.set_ylabel("Force (N)"); ax3.legend()
+
+            # 4) Non-compensated torques
+            ax4 = plt.subplot(2, 3, 4)
+            ax4.plot(df_ft["timestamp"], df_ft["wrench.torque.x"], label="Tx")
+            ax4.plot(df_ft["timestamp"], df_ft["wrench.torque.y"], label="Ty")
+            ax4.plot(df_ft["timestamp"], df_ft["wrench.torque.z"], label="Tz")
+            ax4.set_title("Non-Compensated Torques"); ax4.set_xlabel("Timestamp (ns)"); ax4.set_ylabel("Torque (N·m)"); ax4.legend()
+
+            # 5) Compensated torques
+            ax5 = plt.subplot(2, 3, 5)
+            ax5.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.x"], label="Tx")
+            ax5.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.y"], label="Ty")
+            ax5.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.z"], label="Tz")
+            ax5.set_title("Compensated Torques"); ax5.set_xlabel("Timestamp (ns)"); ax5.set_ylabel("Torque (N·m)"); ax5.legend()
+
+            # 6) Filtered torques
+            ax6 = plt.subplot(2, 3, 6)
+            ax6.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.x_filt"], label="Tx (filt)")
+            ax6.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.y_filt"], label="Ty (filt)")
+            ax6.plot(df_ft["timestamp"], df_ft["wrench_ext.torque.z_filt"], label="Tz (filt)")
+            ax6.set_title(f"Filtered Torques (Butter {ORDER}, {CUTOFF_HZ:g} Hz)"); ax6.set_xlabel("Timestamp (ns)"); ax6.set_ylabel("Torque (N·m)"); ax6.legend()
+
+            # shade contact-free windows everywhere (uses your existing `windows`)
+            for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
+                for (t0, t1) in windows:
+                    ax.axvspan(t0, t1, alpha=0.15, linewidth=0)
+
+            plt.tight_layout()
+            plt.show()
+
+        a = 2
+
+    def transform_wrench_to_tool_and_express_in_world(self):
+        
+        # trajectory of aria on gripper in world frame
+        trajectory_query = self.loader_aria_gripper.get_closed_loop_trajectory_aligned()
+        trajectory_query = trajectory_query[["timestamp", "tx_world_device", "ty_world_device", "tz_world_device", "qw_world_device", "qx_world_device", "qy_world_device", "qz_world_device"]]
     
+        # forces and torques in sensor frame
+        df_ft = self.get_force_torque_measurements()
 
+        # get all necessary transforms
+        T_imu_tool = self.calibration["imu0"]["T_imu_tool"]
+        T_imu_sensor = self.calibration["imu0"]["T_imu_sensor"]
+        T_device_camera = self.loader_aria_gripper.calibration["PINHOLE"]["T_device_camera"]
+        T_cameraRaw_cameraRect = self.loader_aria_gripper.calibration["PINHOLE"]["pinhole_T_device_camera"]
+        T_camera_imu = self.calibration["cam2"]["T_cam_imu"]
+        T_tool_sensor = np.linalg.inv(T_imu_tool) @ T_imu_sensor
+        T_sensor_tool = np.linalg.inv(T_tool_sensor)
+
+        # get force torque origin in sensor frame
+        T_device_sensor = T_device_camera @ T_camera_imu @ T_imu_sensor
+        T_device_tool = T_device_camera @ T_camera_imu @ T_imu_tool
         
+        # get clostest pose of aria in world frame at force torque timestamps
+        # aria poses at 1000 Hz, force torque at 100 Hz
+        timestamps_ns = df_ft["timestamp"].to_numpy(dtype=np.int64)
+        R_world_device_list, t_world_device_list = _slerp_pose_series_to_targets(trajectory_query, timestamps_ns)
+        R_world_device = np.array(R_world_device_list, dtype=np.float64)  # (N, 3, 3)
+        t_world_device = np.array(t_world_device_list, dtype=np.float64)  # (N, 3)
+
+        # T_world_tool = T_world_device @ T_device_tool
+
 if __name__ == "__main__":
 
     # Example usage

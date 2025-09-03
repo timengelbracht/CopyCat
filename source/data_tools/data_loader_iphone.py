@@ -13,6 +13,10 @@ from scipy.spatial.transform import Rotation as R
 from data_indexer import RecordingIndex
 import liblzfse
 import subprocess
+from utils_keyframing import KeyframeExtractor
+from utils import ensure_dir
+import shutil
+
 
 class IPhoneData:
     def __init__(self, base_path: Path, 
@@ -33,28 +37,24 @@ class IPhoneData:
 
         root_raw = Path(self.base_path) / "raw" / self.rec_loc / self.rec_type
 
+        module_base = self.rec_module.split(" ")[0] 
+
         pattern = (
-            f"{self.rec_module}*/"
-            f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}/"
+            f"{module_base}*/"
+            f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}*/"
             "Shareable/*.r3d"
         )
         self.zip_path = list(root_raw.glob(pattern))[0]
-
-        # rgbd_path = self.base_path / "raw" / self.rec_loc / self.rec_type / self.rec_module* / f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}" / "Shareable" / "*.r3d"
-        # self.ply_zip_path = self.base_path / "raw" / self.rec_name / self.sensor_module_name / f"{self.rec_name}" / "Zipped_PLY" / f"{self.rec_name}.zip" 
-        # self.rgb = self.rgbd_path / "rgb"
-        # self.depth = self.rgbd_path / "depth"
-        
+   
+        self.extraction_path_base = self.base_path / "extracted" / self.rec_loc / self.rec_type
         self.extraction_path = self.base_path / "extracted" / self.rec_loc / self.rec_type / self.rec_module / f"{self.rec_loc}_{self.interaction_indices}_{self.rec_type}"
         self.meta_data = self.extraction_path / "metadata"
-        # self.extraction_path = self.base_path / "extracted" / self.rec_loc / self.sensor_module_name
-        # self.extracted_rgbd = (self.extraction_path / "camera_rgb").exists()
-        # self.extracted_plys = (self.extraction_path / "points").exists()
 
         self.label_rgb = f"/camera_rgb"
         self.label_depth = f"/camera_depth"
         self.label_conf = f"/camera_conf"
-        self.label_keyframes = f"/keyframes/rgb"
+        self.label_keyframes = f"visual_registration/keyframes/rgb"
+        self.label_poses = f"/poses"
 
         self.visual_registration_output_path = self.extraction_path / "visual_registration"
 
@@ -62,7 +62,6 @@ class IPhoneData:
         self.fps = None
         self.timestamps = None
         self.logging_tag = f"{self.rec_loc}_{self.rec_type}_{self.rec_module}".upper()
-
 
         self.extract_zip()
         self.load_metadata()
@@ -73,6 +72,8 @@ class IPhoneData:
         
         self.rgb_extension = ".jpg"
 
+        self.statistics = {}
+
     def load_metadata(self):
         if not self.meta_data.exists():
             raise FileNotFoundError(f"Metadata file not found: {self.meta_data}")
@@ -81,14 +82,31 @@ class IPhoneData:
             metadata = json.load(f)
 
         K = metadata.get("K")
+        K_mat = np.array(K).reshape(3, 3).T
 
         self.calibration = {}
+        self.calibration["PINHOLE"] = {}
 
-        self.calibration["K"] = np.array(K).reshape(3, 3).T if K is not None else None
-        self.calibration["h"] = metadata.get("h")
-        self.calibration["w"] = metadata.get("w")
-        self.calibration["dh"] = metadata.get("dh")
-        self.calibration["dw"] = metadata.get("dw")
+        w = metadata.get("w")
+        h = metadata.get("h")
+        dh = metadata.get("dh")
+        dw = metadata.get("dw")
+        f_x = K_mat[0, 0]
+        f_y = K_mat[1, 1]
+        c_x = K_mat[0, 2]
+        c_y = K_mat[1, 2]
+
+        self.calibration["PINHOLE"]["K"] = K_mat
+        self.calibration["PINHOLE"]["h"] = h
+        self.calibration["PINHOLE"]["w"] = w
+        self.calibration["PINHOLE"]["dh"] = dh
+        self.calibration["PINHOLE"]["dw"] = dw
+        self.calibration["PINHOLE"]["colmap_camera_cfg"] = {
+            "model":  "PINHOLE",
+            "width":   w,
+            "height":  h,
+            "params": [f_x, f_y, c_x, c_y],
+        }
 
         self.fps = metadata.get("fps")
         self.timestamps = metadata.get("frameTimestamps")
@@ -101,7 +119,7 @@ class IPhoneData:
         if not self.zip_path.exists():
             raise FileNotFoundError(f"RGB-D path not found: {self.zip_path}")
         
-        if Path(os.path.join(self.extraction_path, "rgbd")).exists():
+        if Path(os.path.join(self.extraction_path, "rgbd")).exists() or Path(os.path.join(self.extraction_path, "camera_rgb")).exists():
             print(f"[{self.logging_tag}] iPhone RGB-D data already extracted to {self.extraction_path}")
             return
     
@@ -113,8 +131,14 @@ class IPhoneData:
                 zip_ref.extract(file, zip_extraction_path)
 
     def extract_rgbd(self):
-        if self.extracted_rgbd:
-            print(f"[{self.logging_tag}] iPhone RGB-D data already extracted to {self.extraction_path}")
+        """
+        Extracts RGB and depth images from the iPhone recording.
+        This method reads the RGB and depth images from the extracted directory,
+        decompresses the depth images, and saves them in the specified output directories.
+        """
+
+        if self._extracted(self.label_rgb) and self._extracted(self.label_depth):
+            print(f"[{self.logging_tag}] RGB-D data already extracted to {self.extraction_path / self.label_rgb.strip('/')}")
             return
 
         rgbd_dir = self.extraction_path / "rgbd"
@@ -130,8 +154,8 @@ class IPhoneData:
         out_dir_rgb.mkdir(parents=True, exist_ok=True)
         out_dir_depth.mkdir(parents=True, exist_ok=True)
 
-        dh = self.calibration["dh"]
-        dw = self.calibration["dw"]
+        dh = self.calibration["PINHOLE"]["dh"]
+        dw = self.calibration["PINHOLE"]["dw"]
 
         for i, timestamp_ns in tqdm(enumerate(timestamps_ns), total=len(timestamps_ns)):
             rgb_img = cv2.imread(str(rgbd_dir / f"{i}.jpg"))
@@ -153,10 +177,8 @@ class IPhoneData:
             out_file_depth = out_dir_depth / f"{timestamp_ns}.npy"
 
             cv2.imwrite(str(out_file_rgb), rgb_img)
-            # cv2.imwrte(str(out_file_depth), depth_img)
             np.save(str(out_file_depth), depth_img)
 
-        # Remove unnecessary files and directories
         # Remove unnecessary files and directories
         for file in [*rgbd_dir.iterdir(), 
                  self.extraction_path / "icon"
@@ -164,54 +186,17 @@ class IPhoneData:
             if file.exists():
                 file.unlink() if file.is_file() else file.rmdir()
 
-        # Remove the rgbd directory itself
-        # if rgbd_dir.exists():
-        #     rgbd_dir.rmdir()
-
         self.extracted_rgbd = True
-
-    # def extract_plys(self):
-
-    #     """
-    #     Extracts the PLY files from the zip file.
-    #     """
-
-    #     if self.extracted_plys:
-    #         print(f"[{self.logging_tag}] PLY files already extracted to {self.extraction_path}")
-    #         return
-
-    #     if not self.ply_zip_path.exists():
-    #         raise FileNotFoundError(f"PLY zip file not found: {self.ply_zip_path}")
-
-    #     timestamps_ns = (np.array(self.timestamps) * 1e9).astype(np.int64).tolist()
-
-    #     out_dir = self.extraction_path / "points"
-    #     out_dir.mkdir(parents=True, exist_ok=True)
-
-    #     with zipfile.ZipFile(self.ply_zip_path, 'r') as zip_ref:
-    #         ply_members = [m for m in zip_ref.namelist() if m.endswith('.ply')]
-            
-    #         if len(ply_members) != len(timestamps_ns):
-    #             raise ValueError("Number of PLY files does not match number of timestamps.")
-
-    #         for idx, member in tqdm(enumerate(ply_members), desc="Extracting PLY files", total=len(ply_members)):
-    #             # Extract to full path (may include subdirs)
-    #             extracted_path = Path(zip_ref.extract(member, out_dir))
-
-    #             # Define flat renamed path
-    #             timestamp_ns = timestamps_ns[idx]
-    #             renamed_path = out_dir / f"{timestamp_ns}.ply"
-
-    #             # Move file (from nested path to flat target)
-    #             extracted_path.rename(renamed_path)
-
-    #     print(f"[{self.logging_tag}] Extracted PLY files to {out_dir}")
 
     def extract_poses(self):
         """
         Extracts the poses from the metadata.
         """
 
+        if self._extracted(self.label_poses):
+            print(f"[{self.logging_tag}] poses data already extracted to {self.extraction_path / self.label_rgb.strip('/')}")
+            return
+        
         poses = self.poses
         timestamps_ns = (np.array(self.timestamps) * 1e9).astype(np.int64).tolist()
         out_dir = self.extraction_path / "poses"
@@ -229,62 +214,65 @@ class IPhoneData:
 
         print(f"[{self.logging_tag}] Extracted poses to {out_dir}")
 
-    def extract_keyframes(self, mode: str = "appearance_based") -> None:
-        """
-        Returns the keyframes as a numpy array.
-        Reads every `stride`-th image from the directory.
-        """
 
-        if not self.extracted_rgbd:
-            raise FileNotFoundError(f"VRS data not extracted to {self.extraction_path}")
+    def extract_keyframes(self, stride: int = 2, force: bool = False, visualize: bool = False) -> None:
+
+        if self._extracted(self.label_keyframes) and not force:
+            print(f"[{self.logging_tag}] Keyframes already extracted to {self.visual_registration_output_path / self.label_keyframes.strip('/')}")
+            return
         
-        if mode not in ["first_frame", "every_15th_frame", "appearance_based"]:
-            raise ValueError("Mode must be one of: 'first_frame', 'every_15th_frame', 'appearance_based'")
+        if not (
+            self._extracted(self.label_rgb)
+            or self._extracted(self.label_depth)
+        ):
+            raise FileNotFoundError(
+            f"[{self.logging_tag}] No RGB, depth data found in "
+            f"{self.extraction_path / self.label_rgb.strip('/')} or "
+            f"{self.extraction_path / self.label_depth.strip('/')}"
+            )
         
-        in_dir = self.extraction_path / self.label_rgb.strip("/")
-        out_dir = self.visual_registration_output_path / self.label_keyframes.strip("/")
+        out_dir = self.extraction_path / self.label_keyframes.strip("/")
+        ensure_dir(out_dir)
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        traj = self.get_trajectory()
-        time_zero = traj["timestamp"].iloc[0]
-
-        # Get sorted list of image files (assumes naming like 0.png, 1.png, ...)
-        image_files = sorted(
-            Path(in_dir).glob("*.jpg"),
+        rgb_files = sorted(
+            self.extraction_path.glob(f"{self.label_rgb.strip('/')}/**/*.jpg"),
             key=lambda x: int(x.stem)
         )
 
-        # Filter images based on time zero
-        image_files_valid = [img for img in image_files if int(img.stem) >= time_zero]
+        depth_files = sorted(
+            self.extraction_path.glob(f"{self.label_depth.strip('/')}/**/*.npy"),
+            key=lambda x: int(x.stem)
+        )
+    
+        # setup the keyframe extractor
+        keyframe_extractor = KeyframeExtractor(
+            rgb_files=rgb_files,
+            depth_files=depth_files,
+            n_keyframes=20,
+            stride=stride)
 
-        if mode == "first_frame":
-            img = cv2.imread(str(image_files_valid[0]))
-            if img is not None:
-                (out_dir / f"{image_files_valid[0].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
-        elif mode == "every_15th_frame":
-            L = len(image_files_valid)
-            indices = np.linspace(0, L - 1, num=min(15, L), dtype=int)
-            for i in indices:
-                img = cv2.imread(str(image_files_valid[i]))
-                if img is not None:
-                    (out_dir / f"{image_files_valid[i].stem}.png").write_bytes(cv2.imencode('.png', img)[1])
-        elif mode == "appearance_based":
-            # Define the input and output patterns
-            input_pattern = str(in_dir / '*.jpg')
-            output_pattern = str(out_dir / f"{image_files_valid[0].stem}.png")
+        if not any(self.statistics.values()):
+            print(f"[{self.logging_tag}] No statistics found, computing...")
+            self.get_statistics(stride=stride)
+        
+        keyframe_extractor.statistics = self.statistics
+        if visualize:
+            keyframe_extractor.visualize_statistics()
+        self.selected_keyframes = keyframe_extractor.extract_keyframes()
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run the ffmpeg command using subprocess
-            ffmpeg_command = [
-                'ffmpeg',
-                '-pattern_type', 'glob',
-                '-i', input_pattern,
-                '-vf', "select='gt(scene,0.4)',showinfo",
-                '-vsync', 'vfr',
-                output_pattern
-            ]
+        # write the list
+        with open(out_dir / "keyframes.txt", "w") as f:
+            for p in self.selected_keyframes:
+                f.write(p.name + "\n")
 
-            subprocess.run(ffmpeg_command, check=True)
+        # copy the actual image files
+        for p in self.selected_keyframes:
+            dst = out_dir / p.name
+            shutil.copy2(p, dst)  # preserves metadata
+
+        print(f"[{self.logging_tag}] Wrote {len(self.selected_keyframes)} keyframes to {out_dir}")
+
 
 
     def extract_video(self, out_dir: Optional[str | Path] = None) -> None:
@@ -323,63 +311,6 @@ class IPhoneData:
             video.write(img)
 
         video.release()
-
-        print(f"[{self.logging_tag}] Saved video to {out_dir}")
-
-    # def extract_depth_video(self, out_dir: Optional[str | Path] = None) -> None:
-    #     """
-    #     Extracts the video from the depth images in the specified directory.
-    #     """
-
-    #     if out_dir is None:
-    #         label_depth = f"/camera_depth"
-    #         out_dir = self.extraction_path / label_depth.strip("/")
-
-    #     video_name = out_dir / 'data.mp4'
-
-    #     # Read and sort images
-    #     images = sorted(
-    #         [img for img in os.listdir(out_dir) if img.endswith(".exr")],
-    #         key=lambda x: int(os.path.splitext(x)[0]))
-
-    #     # Estimate average fps
-    #     timestamps = [int(os.path.splitext(img)[0]) for img in images]
-    #     time_diffs = np.diff(timestamps)  # nanoseconds
-    #     avg_dt = np.mean(time_diffs)  # average nanosecond difference
-    #     fps = 1e9 / avg_dt  # frames per second
-
-    #     print(f"[{self.logging_tag}] Estimated fps: {fps:.2f}")
-
-    #     # Initialize video writer
-    #     frame = cv2.imread(os.path.join(out_dir, images[0]))
-    #     height, width, layers = frame.shape
-    #     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    #     video = cv2.VideoWriter(video_name, fourcc, fps, (width, height))
-
-    #     vmin = None
-    #     vmax = None
-    #     cmap = "turbo"
-
-    #     # Write frames
-    #     for image in tqdm(images, desc="Creating video", total=len(images)):
-    #         depth = cv2.imread(os.path.join(out_dir, image))
-
-    #         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-
-    #         if vmin is None:
-    #             vmin = np.percentile(depth, 5)     # or hard-code e.g. 0.2 m
-    #         if vmax is None:
-    #             vmax = np.percentile(depth, 95)    # or hard-code e.g. 3.0 m
-    #         depth_clipped = np.clip(depth, vmin, vmax)
-    #         depth_norm   = (depth_clipped - vmin) / (vmax - vmin + 1e-8)
-
-    #         img8 = (depth_norm * 255).astype(np.uint8)
-
-    #         heat = cv2.applyColorMap(img8, cv2.COLORMAP_TURBO)
-
-    #         video.write(heat)
-
-    #     video.release()
 
         print(f"[{self.logging_tag}] Saved video to {out_dir}")
 
@@ -451,38 +382,138 @@ class IPhoneData:
 
         return full_cloud
 
+    def _extracted(self, label: str) -> bool:
+        """
+        Check if the data for the given label has been extracted.
+        """
+        label_path = self.extraction_path / label.strip("/")
+        return label_path.exists() and any(label_path.iterdir())
+    
+    def get_statistics(self, stride: int = 1, visualize: bool = False, force: bool = False) -> None:
+        """
+        Computes and visualizes statistics from the RGB and depth data.
+        Strides the RGB and depth files by the given stride.
+        """
 
+        if not self._extracted(self.label_depth) or not self._extracted(self.label_rgb):
+            raise FileNotFoundError(f"[{self.logging_tag}] RGB or depth data not extracted to {self.extraction_path}")
+
+        statistics_file = self.extraction_path / "statistics.json"
+        if statistics_file.exists() and not force:
+            print(f"[{self.logging_tag}] Statistics already computed and saved to {statistics_file}")
+            self.load_statistics()
+            return
+
+        # get RGB files sorted by timestamp
+        rgb_files = sorted(
+            self.extraction_path.glob(f"{self.label_rgb.strip('/')}/**/*{self.rgb_extension}"),
+            key=lambda x: int(x.stem)
+        )
+
+        # get depth files sorted by timestamp
+        depth_files = sorted(
+            self.extraction_path.glob(f"{self.label_depth.strip('/')}/**/*.npy"),
+            key=lambda x: int(x.stem)
+        )
+
+        keyframe_extractor = KeyframeExtractor(
+            rgb_files=rgb_files,
+            depth_files=depth_files,
+            n_keyframes=20,
+            stride=stride
+        )
+
+        self.statistics = keyframe_extractor.get_statistics(
+            force=force
+        )
+        
+        # Save the statistics to a JSON file
+        self.save_statistics(statistics_file)
+
+
+    def save_statistics(self, out_path: str | Path | None = None) -> None:
+        """
+        Saves the computed statistics to a JSON file.
+        """
+        if not self.statistics:
+            raise ValueError(f"[{self.logging_tag}] No statistics computed yet. Call get_statistics() first.")
+
+        if out_path is None:
+            out_path = self.extraction_path / "statistics.json"
+
+        with open(out_path, 'w') as f:
+            json.dump(self.statistics, f, indent=4)
+        print(f"[{self.logging_tag}] Statistics saved to {out_path}")
+
+    def load_statistics(self, in_path: str | Path | None = None) -> None:
+        """
+        Loads the statistics from a JSON file.
+        """
+        if in_path is None:
+            in_path = self.extraction_path / "statistics.json"
+
+        if not Path(in_path).exists():
+            raise FileNotFoundError(f"[{self.logging_tag}] Statistics file not found: {in_path}")
+
+        with open(in_path, 'r') as f:
+            self.statistics = json.load(f)
+        print(f"[{self.logging_tag}] Statistics loaded from {in_path}")
 
 if __name__ == "__main__":
-    rec_location = "bedroom_1"
-    base_path = Path(f"/data/ikea_recordings")
 
-    
-    data_indexer = RecordingIndex(
-        os.path.join(str(base_path), "raw") 
-    )
+    location = False
+    test = True
+    if location:
+        rec_location = "bedroom_1"
+        base_path = Path(f"/data/ikea_recordings")
 
-    iphone_queries_at_loc = data_indexer.query(
-        location=rec_location, 
-        interaction=None, 
-        recorder="iphone*"
-    )
+        
+        data_indexer = RecordingIndex(
+            os.path.join(str(base_path), "raw") 
+        )
 
-    
-    for loc, inter, rec, ii, path in iphone_queries_at_loc:
-        print(f"Found recorder: {rec} at {path}")
+        iphone_queries_at_loc = data_indexer.query(
+            location=rec_location, 
+            interaction=None, 
+            recorder="iphone*"
+        )
 
-        rec_type = inter
-        rec_module = rec
-        interaction_indices = ii
+        
+        for loc, inter, rec, ii, path in iphone_queries_at_loc:
+            print(f"Found recorder: {rec} at {path}")
 
-        iphone_data = IPhoneData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+            rec_type = inter
+            rec_module = rec
+            interaction_indices = ii
 
-        iphone_data.extract_rgbd()
-        iphone_data.extract_poses()
+            iphone_data = IPhoneData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
 
-    # iphone_data.extract_plys()
-    # iphone_data.extract_rgbd()
-    # iphone_data.extract_keyframes(only_first_frame=False)
-    # iphone_data.get_full_cloud_at_timestamp(271350881132)
-    # iphone_data.extract_video()
+            iphone_data.extract_rgbd()
+            iphone_data.extract_poses()
+
+    if test:
+        rec_location = "bedroom_1"
+        base_path = Path(f"/data/ikea_recordings")
+
+        data_indexer = RecordingIndex(
+            os.path.join(str(base_path), "raw") 
+        )
+
+        iphone_queries_at_loc = data_indexer.query(
+            location=rec_location, 
+            interaction="gripper", 
+            recorder="iphone_1*"
+        )
+
+        for loc, inter, rec, ii, path in iphone_queries_at_loc:
+            print(f"Found recorder: {rec} at {path}")
+
+            rec_type = inter
+            rec_module = rec
+            interaction_indices = ii
+
+            iphone_data = IPhoneData(base_path, rec_location, rec_type, rec_module, interaction_indices, data_indexer)
+
+            iphone_data.extract_keyframes()
+
+        a = 2
